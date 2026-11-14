@@ -903,6 +903,262 @@ def update_circuit_breaker(
 
 
 # --------------------------------------------------------------------------
+# Trade history and learning (deterministic, in-context)
+# --------------------------------------------------------------------------
+
+MAX_JOURNAL_TRADES = 12  # closed trades shown in the prompt journal
+MAX_LESSONS = 4  # deterministic coaching rules kept in the prompt
+
+_EXIT_LABELS = {
+    "close": "model-close",
+    "stop": "stop-loss",
+    "target": "take-profit",
+    "liquidated": "LIQUIDATIE",
+}
+
+
+def pair_round_trips(trades: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Pair each opening trade with its closing trade per coin.
+
+    Trades with ``action == "open"`` open a round trip; the first trade of
+    the same coin that carries a ``pnl`` (close, stop, target, liquidated)
+    closes it. Closes without a recorded open are kept with ``entry=None``
+    so no information is silently dropped.
+    """
+    pending: dict[str, list[dict[str, Any]]] = {}
+    pairs: list[dict[str, Any]] = []
+    for trade in trades or []:
+        action = str(trade.get("action", ""))
+        coin = str(trade.get("coin", ""))
+        if action == "open":
+            pending.setdefault(coin, []).append(trade)
+        elif trade.get("pnl") is not None:
+            entry = pending.get(coin)
+            if entry:
+                pairs.append({"entry": entry.pop(0), "exit": trade})
+            else:
+                pairs.append({"entry": None, "exit": trade})
+    return pairs
+
+
+def performance_stats(account: dict[str, Any]) -> dict[str, Any]:
+    """Deterministic performance metrics over closed round-trip trades.
+
+    All numbers come straight from the trade log; no model judgement is
+    involved. Win/loss counts use the recorded PnL (fees excluded, they are
+    reported separately through ``account['fees_paid']``).
+    """
+    pairs = pair_round_trips(account.get("trades", []))
+    closed = [p for p in pairs if p["entry"] is not None]
+    wins = [p for p in closed if float(p["exit"]["pnl"]) > 0]
+    losses = [p for p in closed if float(p["exit"]["pnl"]) < 0]
+
+    def _side_breakdown(side: str) -> dict[str, Any]:
+        sel = [p for p in closed if p["entry"]["side"] == side]
+        return {
+            "count": len(sel),
+            "wins": sum(1 for p in sel if float(p["exit"]["pnl"]) > 0),
+            "pnl": round(sum(float(p["exit"]["pnl"]) for p in sel), 2),
+        }
+
+    def _coin_breakdown() -> dict[str, dict[str, Any]]:
+        by_coin: dict[str, dict[str, Any]] = {}
+        for p in closed:
+            coin = p["entry"]["coin"]
+            slot = by_coin.setdefault(coin, {"count": 0, "wins": 0, "pnl": 0.0})
+            slot["count"] += 1
+            if float(p["exit"]["pnl"]) > 0:
+                slot["wins"] += 1
+            slot["pnl"] = round(slot["pnl"] + float(p["exit"]["pnl"]), 2)
+        return by_coin
+
+    def _streaks() -> tuple[int, int]:
+        current = longest = 0
+        for p in closed:
+            if float(p["exit"]["pnl"]) < 0:
+                current += 1
+                longest = max(longest, current)
+            else:
+                current = 0
+        return current, longest
+
+    exits: dict[str, int] = {}
+    for p in closed:
+        label = str(p["exit"].get("action", "close"))
+        exits[label] = exits.get(label, 0) + 1
+
+    loss_streak_now, longest_loss_streak = _streaks()
+    best = max(closed, key=lambda p: float(p["exit"]["pnl"]), default=None)
+    worst = min(closed, key=lambda p: float(p["exit"]["pnl"]), default=None)
+
+    def _avg_lev(trades_subset: list[dict[str, Any]]) -> float | None:
+        levs = [p["exit"].get("leverage") or p["entry"].get("leverage")
+                for p in trades_subset]
+        levs = [lev for lev in levs if lev]
+        return sum(levs) / len(levs) if levs else None
+
+    return {
+        "closed": len(closed),
+        "wins": len(wins),
+        "losses": len(losses),
+        "win_rate": round(len(wins) / len(closed) * 100.0, 1) if closed else None,
+        "total_pnl": round(sum(float(p["exit"]["pnl"]) for p in closed), 2),
+        "avg_win": round(sum(float(p["exit"]["pnl"]) for p in wins) / len(wins), 2)
+        if wins else None,
+        "avg_loss": round(sum(float(p["exit"]["pnl"]) for p in losses) / len(losses), 2)
+        if losses else None,
+        "by_side": {"long": _side_breakdown("long"), "short": _side_breakdown("short")},
+        "by_coin": _coin_breakdown(),
+        "exits": exits,
+        "loss_streak_now": loss_streak_now,
+        "longest_loss_streak": longest_loss_streak,
+        "best": best,
+        "worst": worst,
+        "avg_win_leverage": _avg_lev(wins),
+        "avg_loss_leverage": _avg_lev(losses),
+    }
+
+
+def learning_lessons(stats: dict[str, Any]) -> list[str]:
+    """Deterministic coaching rules derived from the performance stats.
+
+    Small, conservative and fully rule-based: the model receives these as
+    hard-won context, not as new risk limits (those stay in validate_action).
+    """
+    lessons: list[str] = []
+    if not stats or not stats.get("closed"):
+        return lessons
+    if stats["loss_streak_now"] >= 3:
+        lessons.append(
+            f"Verliesreeks van {stats['loss_streak_now']} trades op een rij: wees "
+            "extra selectief en overweeg een kleinere margin_fraction tot de reeks gebroken is."
+        )
+    for side in ("long", "short"):
+        block = stats["by_side"][side]
+        if block["count"] >= 3 and block["pnl"] < 0:
+            lessons.append(
+                f"{side}-trades hebben tot nu toe netto verlies opgeleverd "
+                f"({block['count']} trades, {_fmt_signed(block['pnl'])} USD): vraag "
+                f"een sterker bevestigd signaal voordat je weer {side} opent."
+            )
+    if stats["exits"].get("liquidated"):
+        lessons.append(
+            f"Er {is_zijn(stats['exits']['liquidated'])} liquidatie(s) geweest: houd "
+            "meer afstand tot de benaderde liquidatieprijs (lagere leverage of ruimere stop)."
+        )
+    if stats["closed"] >= 5 and stats["win_rate"] is not None and stats["win_rate"] < 40:
+        lessons.append(
+            f"Win-rate is {stats['win_rate']:.0f}% over {stats['closed']} trades: verscherp "
+            "je entry-criteria en wacht op duidelijke bevestiging."
+        )
+    if (
+        stats["avg_win_leverage"] is not None
+        and stats["avg_loss_leverage"] is not None
+        and stats["avg_loss_leverage"] > stats["avg_win_leverage"]
+        and stats["closed"] >= 3
+    ):
+        lessons.append(
+            f"Verliezende trades liepen gemiddeld op {stats['avg_loss_leverage']:.1f}x leverage "
+            f"tegen {stats['avg_win_leverage']:.1f}x bij winnaars: verlaag leverage bij twijfel."
+        )
+    return lessons[:MAX_LESSONS]
+
+
+def is_zijn(count: int) -> str:
+    """Dutch agreement helper: 'is 1' vs 'zijn 2+'."""
+    return "is" if count == 1 else "zijn"
+
+
+def _journal_line(pair: dict[str, Any]) -> str:
+    """One-line journal entry for a closed round trip (newest last)."""
+    entry, exit_trade = pair["entry"], pair["exit"]
+    pnl = float(exit_trade["pnl"])
+    margin = float(entry.get("margin") or 0.0)
+    pnl_pct = (pnl / margin * 100.0) if margin > 0 else None
+    label = _EXIT_LABELS.get(str(exit_trade.get("action", "close")), "close")
+    extra = str(exit_trade.get("reason") or "")
+    rationale = str(entry.get("reason") or "")[:120]
+    parts = [
+        f"{exit_trade.get('at', '?')} {entry['coin']} {entry['side']} "
+        f"{exit_trade.get('leverage') or entry.get('leverage')}x: "
+        f"in @ {entry.get('price')}, uit @ {exit_trade.get('price')} ({label}",
+        f"pnl {_fmt_signed(pnl)} USD"
+        + (f" ({pnl_pct:+.0f}% op marge)" if pnl_pct is not None else ""),
+    ]
+    if extra:
+        parts.append(f"reden: {extra[:80]}")
+    if rationale:
+        parts.append(f"entry-idee: {rationale}")
+    return " | ".join(parts)
+
+
+def learning_block(account: dict[str, Any]) -> str:
+    """Performance history + journal + lessons as a prompt block.
+
+    Returns an empty string when no round trip has closed yet: there is
+    nothing to learn from yet, so the prompt stays compact.
+    """
+    stats = performance_stats(account)
+    if not stats["closed"]:
+        return ""
+    pairs = pair_round_trips(account.get("trades", []))
+    closed = [p for p in pairs if p["entry"] is not None]
+    sides = ", ".join(
+        f"{side} {block['count']} ({block['wins']} winst, {_fmt_signed(block['pnl'])} USD)"
+        for side, block in stats["by_side"].items()
+        if block["count"]
+    )
+    coins = ", ".join(
+        f"{coin} {block['count']}x ({_fmt_signed(block['pnl'])} USD)"
+        for coin, block in sorted(stats["by_coin"].items())
+    )
+    exits = ", ".join(
+        f"{count}x {_EXIT_LABELS.get(label, label)}"
+        for label, count in sorted(stats["exits"].items())
+    )
+    lines = [
+        f"- gesloten trades: {stats['closed']} | win-rate "
+        f"{stats['win_rate']:.0f}% | netto resultaat {_fmt_signed(stats['total_pnl'])} USD (excl. fees)",
+        f"- per richting: {sides or 'geen'}",
+        f"- per coin: {coins or 'geen'}",
+        f"- exits: {exits or 'geen'}",
+        f"- verliesreeks nu: {stats['loss_streak_now']} | langste: {stats['longest_loss_streak']}",
+        "JOURNAAL (nieuwste eerst):",
+    ]
+    for pair in list(reversed(closed))[:MAX_JOURNAL_TRADES]:
+        lines.append(f"  - {_journal_line(pair)}")
+    lessons = learning_lessons(stats)
+    if lessons:
+        lines.append("LESSEN (deterministisch afgeleid uit je trades):")
+        for lesson in lessons:
+            lines.append(f"  - {lesson}")
+    return "\n".join(lines)
+
+
+def learning_report_lines(account: dict[str, Any]) -> list[str]:
+    """Compact performance summary + lessons for the Markdown cycle report."""
+    stats = performance_stats(account)
+    if not stats["closed"]:
+        return []
+    lines = [
+        f"- **Gesloten trades:** {stats['closed']} | **Win-rate:** {stats['win_rate']:.0f}% "
+        f"| **Netto resultaat:** {_fmt_signed(stats['total_pnl'])} USD (excl. fees, "
+        f"fees totaal {_fmt_num(account.get('fees_paid', 0.0), 2)} USD)",
+        f"- **Exits:** "
+        + ", ".join(
+            f"{count}x {_EXIT_LABELS.get(label, label)}"
+            for label, count in sorted(stats["exits"].items())
+        )
+        + f" | verliesreeks nu: {stats['loss_streak_now']}, langste: {stats['longest_loss_streak']}",
+    ]
+    lessons = learning_lessons(stats)
+    if lessons:
+        lines.append("**Lessen voor volgende trades:**")
+        lines.extend(f"- {lesson}" for lesson in lessons)
+    return lines
+
+
+# --------------------------------------------------------------------------
 # Prompt building and report rendering
 # --------------------------------------------------------------------------
 
@@ -1081,6 +1337,9 @@ MUNTVERMELDINGEN: {mentions_block}
 ACCOUNTSTATUS (paper):
 {account_state_for_prompt(account, prices)}
 
+PRESTATIEVERLEDEN (leer van je eigen trades):
+{learning_block(account) or "nog geen gesloten trades; er valt nog niets uit eigen historie te leren"}
+
 RISICOREGELS (door de engine afgedwongen, voorstellen buiten deze regels worden geweigerd):
 1. Max leverage per positie: {params['max_leverage']}x (of lager als de coin minder toestaat).
 2. Max marge per trade: {int(params['max_margin_fraction'] * 100)}% van de equity (margin_fraction).
@@ -1095,6 +1354,7 @@ BESLISSCHEMA (antwoord uitsluitend als JSON conform het schema):
 - Wees selectief: alleen een "open" als setup, trend en sentiment samenwijzen; een lege actielijst is een prima uitkomst.
 - Geef bij elke open een stop_loss en take_profit (long: SL onder entry, TP boven entry; short omgekeerd), en een korte rationale in het Nederlands.
 - Sluit posities die hun thesis verliezen of bij bedreigend nieuws/technisch breuk.
+- Neem het prestatieverleden mee: herhaal aanpak die winst opleverde, pas aan wat verlies opleverde, en volg de lessen tenzij de verse marktdata duidelijk anders zegt.
 - Houd rekening met de accountstatus: margin_fraction is een fractie van de equity (bijv. 0.05 = 5%)."""
 
 
@@ -1170,6 +1430,12 @@ def render_cycle_report(
     if account.get("halted"):
         lines.append(f"- ⚠️ **Entries geblokkeerd:** {account.get('halt_reason')}")
     lines.append("")
+    learning_lines = learning_report_lines(account)
+    if learning_lines:
+        lines.append("## Prestatieverleden (leren van trades)")
+        lines.append("")
+        lines.extend(learning_lines)
+        lines.append("")
     if account["positions"]:
         lines.append("| Coin | Richting | Size | Entry | Lev | Marge | Liq ~ | uPnL | SL | TP |")
         lines.append("|---|---|---|---|---|---|---|---|---|---|")

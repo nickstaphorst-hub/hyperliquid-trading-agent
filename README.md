@@ -11,7 +11,7 @@ model-beslissing → deterministische risico-engine → rapport.
 
 ## Hoe het werkt
 
-Elke cyclus (standaard 1 uur):
+Elke cyclus (`cycle_seconds`, in de productie-executie 4 uur):
 
 1. **Marktdata** (publiek, geen API-key nodig):
    - Hyperliquid `allMids` + `metaAndAssetCtxs` (prijs, funding, open interest, max leverage per coin) en `candleSnapshot` (4h candles) voor het universum (standaard BTC/ETH/SOL).
@@ -32,6 +32,17 @@ Elke cyclus (standaard 1 uur):
 | Liquidatie | benadering: entry ∓ 90% van 1/leverage-marge |
 
 Funding wordt in de simulatie niet meegenomen; dat staat in het rapport vermeld.
+
+### Leren van trades (in-context)
+
+De agent leert van zijn eigen (paper-)historie:
+
+- Elke cyclus berekent de engine deterministisch **prestatie-statistieken** uit het handelsjournaal: win-rate, gemiddelde winst/verlies, resultaat per richting en per coin, exit-redenen (model-close, stop-loss, take-profit, liquidatie) en verliesreeksen.
+- Deze statistieken, een compact **journaal van de laatste gesloten trades** (inclusief de oorspronkelijke entry-rationale) en automatisch afgeleide **lessen** (bijv. verliesreeks, verliesgevende richting, liquidatie, te hoge leverage bij verliezers) komen elke cyclus in de prompt als blok `PRESTATIEVERLEDEN`.
+- Het model krijgt de instructie om te leren van winnaars en verliezers; de lessen zijn context, geen nieuwe limieten: de harde risicoregels blijven onveranderd engine-afgedwongen.
+- Het cyclusrapport bevat een sectie **Prestatieverleden** met dezelfde cijfers en lessen.
+
+Zodra er genoeg trades verzameld zijn, kan de gelogde trade-historie (via `get_account`) dienen als dataset voor fine-tuning van het model; dat is bewust nog niet geautomatiseerd.
 
 ## Structuur
 

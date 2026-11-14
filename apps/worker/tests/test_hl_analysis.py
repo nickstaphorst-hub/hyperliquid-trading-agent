@@ -573,5 +573,153 @@ class PromptAndReportTests(unittest.TestCase):
         self.assertIn("GEWEIGERD", block)
 
 
+class LearningTests(unittest.TestCase):
+    """In-context learning: stats, journal, lessons, prompt and report blocks."""
+
+    def _trade(self, action, coin, side, pnl, at, lev=5, margin=100.0, reason=""):
+        return {"coin": coin, "side": side, "action": action, "price": 100.0,
+                "size": 1.0, "notional": 100.0, "leverage": lev, "margin": margin,
+                "pnl": pnl, "fee": 0.0, "at": at, "reason": reason}
+
+    def _account_with_history(self):
+        account = fresh_account()
+        account["trades"] = [
+            self._trade("open", "BTC", "long", None, "t1", reason="oversold bounce"),
+            self._trade("close", "BTC", "long", 50.0, "t2"),
+            self._trade("open", "BTC", "long", None, "t3", lev=3, reason="trendvolg"),
+            self._trade("target", "BTC", "long", 10.0, "t4", lev=3),
+            self._trade("open", "ETH", "short", None, "t5", reason="weerstand"),
+            self._trade("stop", "ETH", "short", -20.0, "t6"),
+            self._trade("open", "ETH", "short", None, "t7"),
+            self._trade("close", "ETH", "short", -30.0, "t8"),
+            self._trade("open", "ETH", "short", None, "t9"),
+            self._trade("liquidated", "ETH", "short", -5.0, "t10"),
+        ]
+        return account
+
+    def test_pair_round_trips(self):
+        trades = [
+            self._trade("open", "BTC", "long", None, "t1"),
+            self._trade("open", "ETH", "short", None, "t2"),
+            self._trade("close", "BTC", "long", 50.0, "t3"),
+            self._trade("stop", "ETH", "short", -20.0, "t4"),
+            self._trade("liquidated", "SOL", "long", -100.0, "t5"),
+        ]
+        pairs = hl_analysis.pair_round_trips(trades)
+        self.assertEqual(len(pairs), 3)
+        self.assertEqual(pairs[0]["entry"]["coin"], "BTC")
+        self.assertEqual(pairs[0]["exit"]["pnl"], 50.0)
+        self.assertEqual(pairs[1]["entry"]["coin"], "ETH")
+        self.assertIsNone(pairs[2]["entry"])
+        self.assertEqual(pairs[2]["exit"]["pnl"], -100.0)
+
+    def test_stats_empty_account(self):
+        stats = hl_analysis.performance_stats(fresh_account())
+        self.assertEqual(stats["closed"], 0)
+        self.assertIsNone(stats["win_rate"])
+        self.assertEqual(hl_analysis.learning_lessons(stats), [])
+        self.assertEqual(hl_analysis.learning_block(fresh_account()), "")
+        self.assertEqual(hl_analysis.learning_report_lines(fresh_account()), [])
+
+    def test_stats_mixed_history(self):
+        stats = hl_analysis.performance_stats(self._account_with_history())
+        self.assertEqual(stats["closed"], 5)
+        self.assertEqual(stats["wins"], 2)
+        self.assertEqual(stats["losses"], 3)
+        self.assertAlmostEqual(stats["win_rate"], 40.0)
+        self.assertAlmostEqual(stats["total_pnl"], 5.0)
+        self.assertAlmostEqual(stats["avg_win"], 30.0)
+        self.assertAlmostEqual(stats["avg_loss"], -18.33)
+        self.assertEqual(stats["by_side"]["long"], {"count": 2, "wins": 2, "pnl": 60.0})
+        self.assertEqual(stats["by_side"]["short"], {"count": 3, "wins": 0, "pnl": -55.0})
+        self.assertEqual(stats["by_coin"]["BTC"], {"count": 2, "wins": 2, "pnl": 60.0})
+        self.assertEqual(stats["by_coin"]["ETH"], {"count": 3, "wins": 0, "pnl": -55.0})
+        self.assertEqual(stats["exits"], {"close": 2, "stop": 1, "target": 1, "liquidated": 1})
+        self.assertEqual(stats["loss_streak_now"], 3)
+        self.assertEqual(stats["longest_loss_streak"], 3)
+        self.assertAlmostEqual(stats["avg_win_leverage"], 4.0)
+        self.assertAlmostEqual(stats["avg_loss_leverage"], 5.0)
+
+    def test_lessons_rules_fire(self):
+        stats = hl_analysis.performance_stats(self._account_with_history())
+        lessons = hl_analysis.learning_lessons(stats)
+        self.assertEqual(len(lessons), 4)
+        self.assertIn("Verliesreeks van 3", lessons[0])
+        self.assertIn("short-trades", lessons[1])
+        self.assertIn("netto verlies", lessons[1])
+        self.assertIn("liquidatie", lessons[2].lower())
+        self.assertIn("Verliezende trades", lessons[3])
+        self.assertIn("verlaag leverage", lessons[3])
+
+    def test_lessons_win_rate_rule(self):
+        trades = []
+        for i in range(6):
+            trades.append(self._trade("open", "BTC", "long", None, f"o{i}"))
+            pnl = 10.0 if i == 0 else -10.0
+            trades.append(self._trade("close", "BTC", "long", pnl, f"c{i}"))
+        account = fresh_account()
+        account["trades"] = trades
+        stats = hl_analysis.performance_stats(account)
+        lessons = hl_analysis.learning_lessons(stats)
+        self.assertTrue(any("Win-rate" in lesson for lesson in lessons))
+
+    def test_learning_block_content(self):
+        block = hl_analysis.learning_block(self._account_with_history())
+        self.assertIn("gesloten trades: 5", block)
+        self.assertIn("win-rate 40%", block)
+        self.assertIn("JOURNAAL", block)
+        self.assertIn("LESSEN", block)
+        self.assertIn("BTC long", block)
+        self.assertIn("ETH short", block)
+        self.assertIn("entry-idee: oversold bounce", block)
+        self.assertIn("LIQUIDATIE", block)
+        self.assertIn("+50% op marge", block)
+
+    def test_prompt_includes_learning(self):
+        account = self._account_with_history()
+        candles = {"BTC": make_candles([float(i) for i in range(80, 120)])}
+        rows = hl_analysis.build_market_rows(PRICES, META, candles)
+        prompt = hl_analysis.build_cycle_prompt(
+            rows, candles, account, PRICES, PARAMS, None, [], None, []
+        )
+        self.assertIn("PRESTATIEVERLEDEN", prompt)
+        self.assertIn("JOURNAAL", prompt)
+        self.assertIn("prestatieverleden mee", prompt)
+
+    def test_prompt_without_history_shows_placeholder(self):
+        candles = {"BTC": make_candles([float(i) for i in range(80, 120)])}
+        rows = hl_analysis.build_market_rows(PRICES, META, candles)
+        prompt = hl_analysis.build_cycle_prompt(
+            rows, candles, fresh_account(), PRICES, PARAMS, None, [], None, []
+        )
+        self.assertIn("PRESTATIEVERLEDEN", prompt)
+        self.assertIn("nog geen gesloten trades", prompt)
+
+    def test_report_includes_learning(self):
+        account = self._account_with_history()
+        candles = {"BTC": make_candles([float(i) for i in range(80, 120)])}
+        rows = hl_analysis.build_market_rows(PRICES, META, candles)
+        decision = {"market_view": "-", "rationale": "", "key_risks": [], "actions": []}
+        report = hl_analysis.render_cycle_report(
+            now_iso="2026-11-14T12:00:00+00:00", rows=rows, account=account,
+            prices=PRICES, params=PARAMS, fear_greed=None, news=[],
+            news_sentiment=None, decision=decision, events=[], model="m",
+        )
+        self.assertIn("## Prestatieverleden", report)
+        self.assertIn("Win-rate", report)
+        self.assertIn("Lessen voor volgende trades", report)
+
+    def test_report_without_history_has_no_learning_section(self):
+        candles = {"BTC": make_candles([float(i) for i in range(80, 120)])}
+        rows = hl_analysis.build_market_rows(PRICES, META, candles)
+        decision = {"market_view": "-", "rationale": "", "key_risks": [], "actions": []}
+        report = hl_analysis.render_cycle_report(
+            now_iso="2026-11-14T12:00:00+00:00", rows=rows, account=fresh_account(),
+            prices=PRICES, params=PARAMS, fear_greed=None, news=[],
+            news_sentiment=None, decision=decision, events=[], model="m",
+        )
+        self.assertNotIn("Prestatieverleden", report)
+
+
 if __name__ == "__main__":
     unittest.main()
