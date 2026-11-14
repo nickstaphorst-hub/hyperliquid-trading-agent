@@ -20,6 +20,7 @@ with the ``get_account``/``get_last_cycle`` queries and reset with the
 from __future__ import annotations
 
 import asyncio
+from datetime import timedelta
 
 from pydantic import BaseModel, Field
 
@@ -202,6 +203,13 @@ async def fetch_news_feeds() -> dict[str, str]:
 @workflows.workflow.define(
     name="hyperliquid-trading-agent",
     workflow_display_name="Hyperliquid Trading Agent",
+    # The platform default execution_timeout is 1 hour; this agent is a
+    # long-running loop, so it opts into a full year. Note the execution
+    # history cap (~51,200 events) is only reached after ~1,5 year at the
+    # default 4h cadence; when that horizon gets closer, add the
+    # Continue-As-New pattern to reset the history while carrying the
+    # account state forward.
+    execution_timeout=timedelta(days=365),
     workflow_description=(
         "Duurzame paper-trading-agent voor Hyperliquid perpetuals met leverage "
         "(max 5x, max 10% marge per trade, max 3 posities, dagverlieslimiet). "

@@ -79,3 +79,10 @@ Managed deployment vanaf `main` met `deploy/docker/Dockerfile.worker`
 (build-directory `.`), daarna de workflow één keer starten via `execute_workflow`;
 de loop draait daarna vanzelf door. Zie de canvas-rapportages in de chat voor de
 laatste status.
+
+**Run-lifetime:** de workflow-definitie heeft `execution_timeout=timedelta(days=365)`
+opt-in; de platform-default is 1 uur, wat de oneindige loop anders halverwege de
+tweede cyclus doodt. Na ~365 dagen (of eerder bij een veel snellere cadence) moet
+de executie opnieuw gestart worden; de execution-history-limiet (~51.200 events)
+ligt bij de 4-urige cadence ruim boven die horizon. Het paper-account begint na
+een herstart weer op de startbalance; trade-historie herleeft binnen één executie.
