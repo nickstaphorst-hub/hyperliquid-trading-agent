@@ -16,7 +16,7 @@ Elke cyclus: standaard uitgelijnd op een vast muurklokslot (elk uur op `:05` na 
 1. **Marktdata** (publiek, geen API-key nodig):
    - Hyperliquid `allMids` + `metaAndAssetCtxs` (prijs, funding, open interest, max leverage per coin) en `candleSnapshot` (4h candles) voor het universum (standaard BTC/ETH/SOL).
    - Fear & Greed Index (alternative.me) en RSS-nieuws (Cointelegraph, Decrypt, CoinDesk) met deterministische sentiment-scores, net als de crypto-market-scan-agent.
-2. **Forced exits**: open posities worden eerst gecheckt tegen (gesimuleerde) liquidatieprijs, stop-loss en take-profit.
+2. **Forced exits**: open posities worden eerst gecheckt tegen (gesimuleerde) liquidatieprijs, stop-loss en take-profit. **Guard-mode:** zolang er posities open staan, checkt een lichte loop (geen model-aanroep, alleen een allMids-request) elke `guard_seconds` (standaard 900 s = 15 min, 0 = uit) de SL/TP/liquidatie-triggers, dus tussen de uurscycli door.
 3. **Model-beslissing**: een Mistral-model krijgt markt, sentiment, nieuws én de volledige accountstatus en stelt maximaal N acties voor (`open`/`close`/`none` met leverage, margin-fraction, SL/TP en rationale).
 4. **Risico-engine** (deterministisch, in `hl_analysis.py`) valideert élke actie en simuleert de fill tegen de live mid-prijs. Voorstellen buiten de regels worden geweigerd en als zodanig gerapporteerd.
 
@@ -71,7 +71,7 @@ python3 dryrun_live.py                         # live dry-run tegen Hyperliquid/
 `universe` (BTC/ETH/SOL), `interval` (4h), `candles_limit` (180), `model`
 (mistral-medium-latest), `risk_profile` (balanced), `max_leverage` (5),
 `max_margin_fraction` (0.10), `max_open_positions` (3), `daily_loss_limit_pct` (5),
-`start_balance_usd` (1000), `cycle_seconds` (3600), `trading_mode` (alleen "paper").
+`start_balance_usd` (1000), `cycle_seconds` (3600), `align_to_hour`/`cycle_minute` (elk uur op :05), `guard_seconds` (900, 0 = uit), `trading_mode` (alleen "paper").
 
 ## Deployment
 

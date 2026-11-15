@@ -66,6 +66,7 @@ class AgentInput(BaseModel):
     cycle_seconds: int = Field(default=3600, ge=300, le=86_400)
     align_to_hour: bool = True
     cycle_minute: int = Field(default=5, ge=0, le=59)
+    guard_seconds: int = Field(default=900, ge=0, le=3600)  # 0 = guard uit
     trading_mode: str = "paper"
 
 
@@ -159,6 +160,22 @@ async def fetch_hl_market(coins: list[str], interval: str, candles_limit: int) -
         "meta": meta_payload,
         "candles": candles,
     }
+
+
+@workflows.activity()
+async def fetch_mid_prices(coins: list[str]) -> dict[str, float]:
+    """Cheap guard activity: only current mid prices for the universe.
+
+    Used between full cycles to enforce SL/TP/liquidation without a model
+    call; a single allMids request, no candles, no meta.
+    """
+    import httpx
+
+    async with httpx.AsyncClient(timeout=30.0) as client:
+        mids_payload = await _hl_post(client, {"type": "allMids"})
+    prices = hl_analysis.parse_all_mids(mids_payload)
+    wanted = {c.upper() for c in coins}
+    return {coin.upper(): price for coin, price in prices.items() if coin.upper() in wanted}
 
 
 @workflows.activity()
@@ -345,6 +362,51 @@ class HyperliquidTradingAgent:
         }
         self.last_error = None
 
+    async def _run_guard(self, inp: AgentInput) -> list[dict]:
+        """Lightweight SL/TP/liquidation check between full cycles.
+
+        No model call: the deterministic engine runs ``process_forced_exits``
+        against fresh mid prices. Forced exits land in the trade log via the
+        engine itself and are surfaced in ``get_last_cycle``.
+        """
+        now = await now_utc()
+        coins = [c.upper() for c in inp.universe]
+        prices = await fetch_mid_prices(coins)
+        events = hl_analysis.process_forced_exits(self.account, prices, now)
+        if events and self.last_cycle is not None:
+            self.last_cycle["events"] = events
+            self.last_cycle["guard_at"] = now
+        return events
+
+    async def _sleep_to_next_cycle(self, input: AgentInput) -> None:
+        """Sleep until the next cycle slot, guarding open positions.
+
+        While positions are open the sleep is split into guard steps
+        (``guard_seconds``, default 15 min, 0 = off) so SL/TP/liquidation
+        are enforced without waiting for the next full model cycle. Without
+        open positions the agent sleeps straight to the slot.
+        """
+        while True:
+            now = await now_utc()
+            if input.align_to_hour:
+                delay = hl_analysis.next_cycle_delay_seconds(now, input.cycle_minute)
+            else:
+                delay = float(input.cycle_seconds)
+            if (
+                delay <= 60
+                or not input.guard_seconds
+                or not self.account.get("positions")
+            ):
+                await workflows.workflow.sleep(max(60, int(delay)))
+                return
+            step = min(float(input.guard_seconds), delay)
+            await workflows.workflow.sleep(max(60, int(step)))
+            if self.account.get("positions"):
+                try:
+                    await self._run_guard(input)
+                except Exception as exc:  # noqa: BLE001 - guard failure must not kill the loop
+                    self.last_error = f"guard: {type(exc).__name__}: {exc}"
+
     @workflows.workflow.entrypoint
     async def run(self, input: AgentInput) -> None:
         if input.trading_mode not in TRADING_MODES:
@@ -373,14 +435,10 @@ class HyperliquidTradingAgent:
         # First cycle runs immediately at start; later cycles align to a
         # fixed wall-clock slot (HH:cycle_minute, default :05 past the hour)
         # so the schedule never drifts and feeds/candles are freshest.
+        # Between slots, open positions are guarded every guard_seconds.
         while True:
             try:
                 await self._run_cycle(input)
             except Exception as exc:  # noqa: BLE001 - the loop must survive
                 self.last_error = f"{type(exc).__name__}: {exc}"
-            if input.align_to_hour:
-                now = await now_utc()
-                delay = hl_analysis.next_cycle_delay_seconds(now, input.cycle_minute)
-            else:
-                delay = float(input.cycle_seconds)
-            await workflows.workflow.sleep(max(60, int(delay)))
+            await self._sleep_to_next_cycle(input)
