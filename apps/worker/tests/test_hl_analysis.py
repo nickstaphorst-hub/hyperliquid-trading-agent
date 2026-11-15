@@ -721,5 +721,29 @@ class LearningTests(unittest.TestCase):
         self.assertNotIn("Prestatieverleden", report)
 
 
+    def test_next_cycle_delay_seconds_slots(self):
+        delay = hl_analysis.next_cycle_delay_seconds("2026-11-15T10:00:00+00:00", 5)
+        self.assertAlmostEqual(delay, 300.0)
+        delay = hl_analysis.next_cycle_delay_seconds("2026-11-15T10:30:00+00:00", 5)
+        self.assertAlmostEqual(delay, 2100.0)
+        # exactly at the slot -> next hour
+        delay = hl_analysis.next_cycle_delay_seconds("2026-11-15T10:05:00+00:00", 5)
+        self.assertAlmostEqual(delay, 3600.0)
+        # ends within a minute of the next slot -> skip to the following hour
+        delay = hl_analysis.next_cycle_delay_seconds("2026-11-15T10:04:59+00:00", 5)
+        self.assertAlmostEqual(delay, 3601.0)
+        # naive timestamp is treated as UTC
+        delay = hl_analysis.next_cycle_delay_seconds("2026-11-15T10:00:00", 5)
+        self.assertAlmostEqual(delay, 300.0)
+        # broken input falls back to one hour
+        self.assertAlmostEqual(hl_analysis.next_cycle_delay_seconds("geen-tijd", 5), 3600.0)
+
+    def test_next_cycle_delay_seconds_clamps_minute(self):
+        delay = hl_analysis.next_cycle_delay_seconds("2026-11-15T10:00:00+00:00", 99)
+        self.assertAlmostEqual(delay, 3540.0)  # treated as :59
+        delay = hl_analysis.next_cycle_delay_seconds("2026-11-15T10:00:00+00:00", -3)
+        self.assertAlmostEqual(delay, 3600.0)  # treated as :00 -> next hour
+
+
 if __name__ == "__main__":
     unittest.main()

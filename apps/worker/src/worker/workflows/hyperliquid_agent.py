@@ -64,6 +64,8 @@ class AgentInput(BaseModel):
     daily_loss_limit_pct: float = Field(default=5.0, ge=1.0, le=25.0)
     start_balance_usd: float = Field(default=1000.0, ge=100.0, le=1_000_000.0)
     cycle_seconds: int = Field(default=3600, ge=300, le=86_400)
+    align_to_hour: bool = True
+    cycle_minute: int = Field(default=5, ge=0, le=59)
     trading_mode: str = "paper"
 
 
@@ -368,9 +370,17 @@ class HyperliquidTradingAgent:
 
         # The agent never dies: a failing cycle (API down, model error) is
         # recorded and the loop simply tries again after the next sleep.
+        # First cycle runs immediately at start; later cycles align to a
+        # fixed wall-clock slot (HH:cycle_minute, default :05 past the hour)
+        # so the schedule never drifts and feeds/candles are freshest.
         while True:
             try:
                 await self._run_cycle(input)
             except Exception as exc:  # noqa: BLE001 - the loop must survive
                 self.last_error = f"{type(exc).__name__}: {exc}"
-            await workflows.workflow.sleep(input.cycle_seconds)
+            if input.align_to_hour:
+                now = await now_utc()
+                delay = hl_analysis.next_cycle_delay_seconds(now, input.cycle_minute)
+            else:
+                delay = float(input.cycle_seconds)
+            await workflows.workflow.sleep(max(60, int(delay)))

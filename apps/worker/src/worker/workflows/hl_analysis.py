@@ -865,6 +865,33 @@ def process_forced_exits(
     return events
 
 
+def next_cycle_delay_seconds(now_iso: str, cycle_minute: int = 5) -> float:
+    """Seconds to sleep until the next wall-clock slot at ``cycle_minute``.
+
+    Aligned cycles run a few minutes past each hour (:05 by default) instead
+    of drifting with the cycle duration: every cycle then sees the hour's
+    freshest news feeds, and at 00/04/08/12/16/20 UTC a freshly closed 4h
+    candle. A cycle that ends less than a minute before the next slot (rare)
+    waits for the following hour to avoid a tight loop.
+    """
+    try:
+        now = datetime.fromisoformat(now_iso)
+    except (TypeError, ValueError):
+        return 3600.0
+    if now.tzinfo is None:
+        now = now.replace(tzinfo=timezone.utc)
+    now = now.astimezone(timezone.utc)
+    minute = max(0, min(59, int(cycle_minute)))
+    slot = now.replace(minute=minute, second=0, microsecond=0)
+    if slot <= now:
+        slot += timedelta(hours=1)
+    delay = (slot - now).total_seconds()
+    if delay < 60:
+        slot += timedelta(hours=1)
+        delay = (slot - now).total_seconds()
+    return delay
+
+
 def roll_day_if_needed(
     account: dict[str, Any],
     now_iso: str,

@@ -11,7 +11,7 @@ model-beslissing → deterministische risico-engine → rapport.
 
 ## Hoe het werkt
 
-Elke cyclus (`cycle_seconds`, in de productie-executie 4 uur):
+Elke cyclus: standaard uitgelijnd op een vast muurklokslot (elk uur op `:05` na het uur, via `align_to_hour=True` + `cycle_minute`), zodat het schema niet afhangt van de cyclusduur en de feeds (en bij de 4-uursgrenzen de net gesloten 4h-candles) freshest zijn. Met `align_to_hour=False` geldt de vaste slaap `cycle_seconds`:
 
 1. **Marktdata** (publiek, geen API-key nodig):
    - Hyperliquid `allMids` + `metaAndAssetCtxs` (prijs, funding, open interest, max leverage per coin) en `candleSnapshot` (4h candles) voor het universum (standaard BTC/ETH/SOL).
