@@ -745,5 +745,19 @@ class LearningTests(unittest.TestCase):
         self.assertAlmostEqual(delay, 3600.0)  # treated as :00 -> next hour
 
 
+    def test_guard_sleep_steps_lands_on_slot(self):
+        # exact multiple: last step ends precisely on the slot
+        self.assertEqual(hl_analysis.guard_sleep_steps(3600, 900), [900, 900, 900, 900])
+        # remainder becomes the final step, never a guard past the slot
+        self.assertEqual(hl_analysis.guard_sleep_steps(1860, 900), [900, 900, 60])
+        # wait shorter than one guard interval: single unguarded sleep
+        self.assertEqual(hl_analysis.guard_sleep_steps(500, 900), [500])
+        # guard disabled
+        self.assertEqual(hl_analysis.guard_sleep_steps(3600, 0), [3600])
+        # sums always equal the target
+        for target, guard in ((2745, 900), (3601, 900), (7200, 14400), (120, 60)):
+            self.assertAlmostEqual(sum(hl_analysis.guard_sleep_steps(target, guard)), target)
+
+
 if __name__ == "__main__":
     unittest.main()

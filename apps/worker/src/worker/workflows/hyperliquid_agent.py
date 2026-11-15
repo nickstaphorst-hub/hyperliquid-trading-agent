@@ -381,31 +381,34 @@ class HyperliquidTradingAgent:
     async def _sleep_to_next_cycle(self, input: AgentInput) -> None:
         """Sleep until the next cycle slot, guarding open positions.
 
-        While positions are open the sleep is split into guard steps
-        (``guard_seconds``, default 15 min, 0 = off) so SL/TP/liquidation
-        are enforced without waiting for the next full model cycle. Without
-        open positions the agent sleeps straight to the slot.
+        The target slot is computed ONCE; the wait is then split into guard
+        steps (``guard_seconds``, default 15 min, 0 = off). The last step
+        always ends exactly on the slot so the model cycle runs there,
+        regardless of guard timing. Without open positions the agent sleeps
+        straight to the slot. A guard step that closes the last position
+        bails out and sleeps the remaining time.
         """
-        while True:
-            now = await now_utc()
-            if input.align_to_hour:
-                delay = hl_analysis.next_cycle_delay_seconds(now, input.cycle_minute)
-            else:
-                delay = float(input.cycle_seconds)
-            if (
-                delay <= 60
-                or not input.guard_seconds
-                or not self.account.get("positions")
-            ):
-                await workflows.workflow.sleep(max(60, int(delay)))
+        now = await now_utc()
+        if input.align_to_hour:
+            target_delay = hl_analysis.next_cycle_delay_seconds(now, input.cycle_minute)
+        else:
+            target_delay = float(input.cycle_seconds)
+        steps = hl_analysis.guard_sleep_steps(target_delay, input.guard_seconds)
+        if len(steps) == 1:
+            await workflows.workflow.sleep(max(1, int(steps[0])))
+            return
+        for index, step in enumerate(steps):
+            await workflows.workflow.sleep(max(1, int(step)))
+            if index == len(steps) - 1:
                 return
-            step = min(float(input.guard_seconds), delay)
-            await workflows.workflow.sleep(max(60, int(step)))
-            if self.account.get("positions"):
-                try:
-                    await self._run_guard(input)
-                except Exception as exc:  # noqa: BLE001 - guard failure must not kill the loop
-                    self.last_error = f"guard: {type(exc).__name__}: {exc}"
+            if not self.account.get("positions"):
+                remaining = sum(steps[index + 1:])
+                await workflows.workflow.sleep(max(1, int(remaining)))
+                return
+            try:
+                await self._run_guard(input)
+            except Exception as exc:  # noqa: BLE001 - guard failure must not kill the loop
+                self.last_error = f"guard: {type(exc).__name__}: {exc}"
 
     @workflows.workflow.entrypoint
     async def run(self, input: AgentInput) -> None:

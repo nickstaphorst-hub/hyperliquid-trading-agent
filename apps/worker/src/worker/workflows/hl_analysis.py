@@ -892,6 +892,26 @@ def next_cycle_delay_seconds(now_iso: str, cycle_minute: int = 5) -> float:
     return delay
 
 
+def guard_sleep_steps(target_delay: float, guard_seconds: int) -> list[float]:
+    """Split a wait into guard steps whose final step lands on the slot.
+
+    The last step is the remainder, so the model cycle always starts at its
+    slot even when guard wakes would otherwise coincide with it. With
+    ``guard_seconds <= 0`` the wait is a single unguarded sleep.
+    """
+    target = max(0.0, float(target_delay))
+    guard = float(guard_seconds or 0)
+    if guard <= 0 or target <= guard:
+        return [target]
+    steps: list[float] = []
+    remaining = target
+    while remaining > guard:
+        steps.append(guard)
+        remaining -= guard
+    steps.append(remaining)
+    return steps
+
+
 def roll_day_if_needed(
     account: dict[str, Any],
     now_iso: str,
