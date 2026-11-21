@@ -759,5 +759,177 @@ class LearningTests(unittest.TestCase):
             self.assertAlmostEqual(sum(hl_analysis.guard_sleep_steps(target, guard)), target)
 
 
+
+
+class ShadowLadderTests(unittest.TestCase):
+    """Upgrade B in shadow-modus: de ladder meet, grijpt nooit in."""
+
+    def _open(self, account, direction="long", stop=None, target=None, margin_fraction=0.10):
+        events = hl_analysis.apply_actions(
+            account,
+            [{"action": "open", "coin": "BTC", "direction": direction,
+              "leverage": 5, "margin_fraction": margin_fraction,
+              "stop_loss": stop, "take_profit": target, "rationale": "shadow-test"}],
+            PRICES, "2026-11-14T11:00:00+00:00", PARAMS, META,
+        )
+        self.assertEqual(events[0]["type"], "open")
+        return account["positions"]["BTC"]
+
+    def _tracker(self, account):
+        return account["shadow_b"]["positions"]["BTC"]
+
+    def test_ladder_phases_be_trailing_and_shadow_exit_long(self):
+        account = fresh_account()
+        self._open(account, stop=99.0, target=105.0)
+        # entry 100, SL 99 -> sl_dist 1.0, size 5 -> 1R = 5 USD
+        tracker = self._tracker(account)
+        self.assertAlmostEqual(tracker["r_unit_usd"], 5.0)
+        self.assertEqual(tracker["phase"], 0)
+        self.assertEqual(tracker["shadow_stop"], 99.0)
+
+        # +0.5R: geen faseverandering
+        hl_analysis.shadow_b_update(account, {"BTC": 100.5}, "t1")
+        self.assertEqual(tracker["phase"], 0)
+        self.assertAlmostEqual(tracker["mfe_r"], 0.5)
+
+        # +1.2R: BE-lock op entry + rondje fees (100.09)
+        hl_analysis.shadow_b_update(account, {"BTC": 101.2}, "t2")
+        self.assertEqual(tracker["phase"], 1)
+        self.assertAlmostEqual(tracker["shadow_stop"], 100.09, places=4)
+
+        # +3R: trailing start en direct getraild op top - 1R
+        hl_analysis.shadow_b_update(account, {"BTC": 103.0}, "t3")
+        self.assertEqual(tracker["phase"], 2)
+        self.assertAlmostEqual(tracker["shadow_stop"], 102.0)
+
+        # top 104.5 -> trail gaat mee naar 103.5
+        hl_analysis.shadow_b_update(account, {"BTC": 104.5}, "t4")
+        self.assertAlmostEqual(tracker["shadow_stop"], 103.5)
+
+        # terug naar 103.0 raakt de trail: schaduw-exit op 103.5 (r=3.5)
+        events = hl_analysis.shadow_b_update(account, {"BTC": 103.0}, "t5")
+        self.assertEqual(tracker["shadow_exit"]["price"], 103.5)
+        self.assertAlmostEqual(tracker["shadow_exit"]["r"], 3.5)
+        self.assertTrue(any(e["type"] == "shadow-exit" for e in events))
+
+        # de ECHTE positie is onaangeroerd: zelfde SL, geen extra trades
+        self.assertEqual(account["positions"]["BTC"]["stop_loss"], 99.0)
+        self.assertEqual(len(account["trades"]), 1)
+
+        # echte close op 102.5 -> journaal vergeleelt ladder (3.5R) vs echt (2.5R)
+        hl_analysis.close_position(account, "BTC", 102.5, "t6", "close")
+        journal = account["shadow_b"]["journal"]
+        self.assertEqual(len(journal), 1)
+        entry = journal[0]
+        self.assertEqual(entry["comparison"], "ladder-eerst")
+        self.assertAlmostEqual(entry["real_r"], 2.5)
+        self.assertAlmostEqual(entry["shadow_r"], 3.5)
+        self.assertAlmostEqual(entry["delta_r"], 1.0)
+
+        summary = hl_analysis.shadow_b_summary(account)
+        self.assertEqual(summary["resolved"], 1)
+        self.assertAlmostEqual(summary["delta_r"], 1.0)
+        # tracker opgeruimd
+        self.assertNotIn("BTC", account["shadow_b"]["positions"])
+
+    def test_ladder_mirrors_for_short(self):
+        account = fresh_account()
+        self._open(account, direction="short", stop=101.5, target=95.0)
+        tracker = self._tracker(account)
+        sl_dist = 1.5
+
+        # short: gunst is dalen; entry 100, prijs 98.5 -> +1R -> BE-lock
+        hl_analysis.shadow_b_update(account, {"BTC": 98.5}, "t1")
+        self.assertEqual(tracker["phase"], 1)
+        self.assertAlmostEqual(tracker["shadow_stop"], 100.0 - 100.0 * hl_analysis.TAKER_FEE_RATE * 2, places=4)
+
+        # prijs 95 -> +3.33R: trailing, stop op fav + 1R afstand
+        hl_analysis.shadow_b_update(account, {"BTC": 95.0}, "t2")
+        self.assertEqual(tracker["phase"], 2)
+        self.assertAlmostEqual(tracker["shadow_stop"], 95.0 + sl_dist)
+
+        # terug naar 96.6 raakt de trail: schaduw-exit op 96.5
+        hl_analysis.shadow_b_update(account, {"BTC": 96.6}, "t3")
+        self.assertAlmostEqual(tracker["shadow_exit"]["price"], 96.5)
+        self.assertAlmostEqual(tracker["shadow_exit"]["r"], (100.0 - 96.5) / sl_dist, places=3)
+        self.assertIn("BTC", account["positions"])  # echt blijft open
+
+    def test_shadow_stop_follows_actual_sl_until_first_r(self):
+        account = fresh_account()
+        self._open(account, stop=99.0)
+        # dip naar 98.9 raakt de (schaduw-)SL gewoon, nog in fase 0
+        events = hl_analysis.shadow_b_update(account, {"BTC": 98.9}, "t1")
+        tracker = self._tracker(account)
+        self.assertEqual(tracker["shadow_exit"]["reason"], "shadow-stop")
+        self.assertAlmostEqual(tracker["shadow_exit"]["r"], -1.0)
+        # en de echte stop-close journalt netjes met delta 0
+        hl_analysis.process_forced_exits(account, {"BTC": 98.9}, "t2")
+        entry = account["shadow_b"]["journal"][0]
+        self.assertEqual(entry["reason"], "stop")
+        self.assertAlmostEqual(entry["real_r"], -1.0)
+        self.assertAlmostEqual(entry["delta_r"], 0.0)
+
+    def test_no_sl_means_dormant_ladder(self):
+        account = fresh_account()
+        self._open(account, stop=None)
+        tracker = self._tracker(account)
+        self.assertIsNone(tracker["r_unit_usd"])
+        hl_analysis.shadow_b_update(account, {"BTC": 130.0}, "t1")
+        self.assertEqual(tracker["phase"], 0)
+        self.assertIsNone(tracker["shadow_exit"])
+        hl_analysis.close_position(account, "BTC", 110.0, "t2", "close")
+        entry = account["shadow_b"]["journal"][0]
+        self.assertEqual(entry["comparison"], "geen-SL: ladder inactief")
+        summary = hl_analysis.shadow_b_summary(account)
+        self.assertEqual(summary["resolved"], 0)
+        self.assertEqual(summary["trades"], 1)
+
+    def test_real_exit_while_ladder_active_is_unresolved(self):
+        account = fresh_account()
+        self._open(account, stop=99.0, target=105.0)
+        hl_analysis.shadow_b_update(account, {"BTC": 100.5}, "t1")  # +0.5R, geen fase
+        hl_analysis.close_position(account, "BTC", 100.5, "t2", "close")
+        entry = account["shadow_b"]["journal"][0]
+        self.assertEqual(entry["comparison"], "echte-exit-eerst")
+        self.assertIsNone(entry["delta_r"])
+
+    def test_liquidation_journals_without_crash(self):
+        account = fresh_account()
+        # SL ver onder de liq-prijs zodat de liquidatie-tak eerst slaat
+        self._open(account, stop=80.0)
+        hl_analysis.process_forced_exits(account, {"BTC": 81.0}, "t1")
+        self.assertNotIn("BTC", account["positions"])
+        entry = account["shadow_b"]["journal"][0]
+        self.assertEqual(entry["reason"], "liquidated")
+        self.assertAlmostEqual(entry["real_r"], (82.0 - 100.0) / 20.0, places=3)
+
+    def test_report_lines_and_purity_for_model(self):
+        account = fresh_account()
+        self._open(account, stop=99.0)
+        hl_analysis.shadow_b_update(account, {"BTC": 101.2}, "t1")
+        lines = hl_analysis.shadow_b_report_lines(account, {"BTC": 101.2})
+        self.assertTrue(any("Shadow-exitladder" in ln for ln in lines))
+        self.assertTrue(any("BE-lock" in ln for ln in lines))
+        # de model-prompt blijft schoon: geen shadow-tekst in de promptblokken
+        prompt_block = hl_analysis.account_state_for_prompt(account, {"BTC": 101.2})
+        self.assertNotIn("shadow", prompt_block.lower())
+        # lege shadow-state -> geen sectie
+        self.assertEqual(hl_analysis.shadow_b_report_lines(fresh_account(), PRICES), [])
+
+    def test_shadow_update_never_mutates_trading_state(self):
+        account = fresh_account()
+        self._open(account, stop=99.0, target=105.0)
+        before_balance = account["balance"]
+        before_realized = account["realized_pnl"]
+        before_sl = account["positions"]["BTC"]["stop_loss"]
+        hl_analysis.shadow_b_update(account, {"BTC": 104.0}, "t1")
+        hl_analysis.shadow_b_update(account, {"BTC": 101.5}, "t2")
+        self.assertEqual(account["balance"], before_balance)
+        self.assertEqual(account["realized_pnl"], before_realized)
+        self.assertEqual(account["positions"]["BTC"]["stop_loss"], before_sl)
+        self.assertEqual(len(account["trades"]), 1)
+        self.assertEqual(account["positions"]["BTC"]["take_profit"], 105.0)
+
+
 if __name__ == "__main__":
     unittest.main()

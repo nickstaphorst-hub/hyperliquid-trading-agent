@@ -44,6 +44,21 @@ De agent leert van zijn eigen (paper-)historie:
 
 Zodra er genoeg trades verzameld zijn, kan de gelogde trade-historie (via `get_account`) dienen als dataset voor fine-tuning van het model; dat is bewust nog niet geautomatiseerd.
 
+## Shadow-exitladder (Upgrade B, meekijk-modus)
+
+Sinds deze versie draait er een **R-gebaseerd exit-systeem in shadow-modus** mee. Het berekent per open positie wat het éxít-systeem zou doen, zonder ooit iets uit te voeren:
+
+- **1R** = initiële SL-afstand × size (de risico-eenheid van de trade).
+- **BE-lock**: zodra uPnL >= +1R zou de SL naar breakeven (entry + rondje taker-fees) gaan.
+- **Trailing**: vanaf +2R zou de SL op 1R achter het gunstigste prijspunt meebewegen; elke guard-stap (15 min) en elke cyclus wordt de ladder bijgewerkt.
+
+Belangrijke eigenschappen:
+
+- De ladder blokkeert, sluit of wijzigt niets: posities, SL/TP, balans en handelslog blijven exact wat de agent ervan maakt.
+- De vergelijking is **zuiver**: de model-prompt krijgt de shadow-data bewust níet te zien, zodat het beslisgedrag van de agent niet wordt beïnvloed.
+- Per gesloten trade journaleert de ladder de vergelijking: echte exit-R vs ladder-exit-R (`delta_r`), plus MFE-R/MAE-R. Alles zit in `account["shadow_b"]` (zichtbaar via `get_account`) en in de sectie **Shadow-exitladder** van het cyclusrapport.
+- Doel: na 1 à 2 weken shadow-data beslissen of BE-lock/trailing de echte exit-regels gaan aanvullen of vervangen.
+
 ## Structuur
 
 ```

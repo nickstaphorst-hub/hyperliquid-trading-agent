@@ -335,6 +335,10 @@ class HyperliquidTradingAgent:
         )
         hl_analysis.update_circuit_breaker(account, prices, inp.daily_loss_limit_pct)
 
+        # Shadow exit-ladder (Upgrade B): meekijken met verse prijzen, nooit uitvoeren.
+        # Bewust ná apply_actions: nieuwe posities krijgen dan direct een tracker.
+        hl_analysis.shadow_b_update(account, prices, now)
+
         report_markdown = hl_analysis.render_cycle_report(
             now_iso=now,
             rows=rows,
@@ -373,6 +377,9 @@ class HyperliquidTradingAgent:
         coins = [c.upper() for c in inp.universe]
         prices = await fetch_mid_prices(coins)
         events = hl_analysis.process_forced_exits(self.account, prices, now)
+        # Shadow exit-ladder (Upgrade B) draait mee op guard-cadence (elke 15 min),
+        # net als de echte ladder later zou doen; loggen, nooit uitvoeren.
+        hl_analysis.shadow_b_update(self.account, prices, now)
         if events and self.last_cycle is not None:
             self.last_cycle["events"] = events
             self.last_cycle["guard_at"] = now
