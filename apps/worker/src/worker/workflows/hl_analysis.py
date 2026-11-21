@@ -483,6 +483,327 @@ def coin_mention_counts(
 # Paper account engine (pure, deterministic)
 # --------------------------------------------------------------------------
 
+# --------------------------------------------------------------------------
+# Shadow exit-ladder: R-gebaseerd exit-systeem (Upgrade B, shadow-modus)
+#
+# Meekijk-modus: de ladder berekent per open positie wat het R-gebaseerde
+# exit-systeem ZOU doen. 1R = initiële SL-afstand x size (USD).
+#   - uPnL >= +1R: SL naar breakeven (entry + rondje taker-fees)   "BE-lock"
+#   - uPnL >= +2R: SL trailt op 1R achter het gunstigste prijspunt "trailing"
+# De ladder voert NIETS uit: ze wijzigt geen posities, SL/TP of balans en
+# blokkeert geen enkele actie. Ze logt schaduwevents en een journaal dat per
+# gesloten trade de echte exit (model/stop/target/liquidatie) vergelijkt met
+# de ladder-exit. De model-prompt krijgt deze data bewust NIET te zien, zodat
+# het beslisgedrag van de agent en daarmee de vergelijking zuiver blijven.
+# --------------------------------------------------------------------------
+
+SHADOW_B_VERSION = 1
+SHADOW_B_MAX_LOG = 60  # schaduwevents bewaard in de state
+SHADOW_B_MAX_JOURNAL = 30  # vergeleken trades bewaard in de state
+
+_SHADOW_PHASE_LABELS = {0: "initieel", 1: "BE-lock", 2: "trailing"}
+
+
+def _shadow_b_state() -> dict[str, Any]:
+    """Versie-getagde shadow-state (JSON-serialiseerbaar, engine-owned)."""
+    return {
+        "version": SHADOW_B_VERSION,
+        "mode": "shadow",
+        "risk_pct": 1.0,  # beoogd risico per trade (informatief; sizing bepaalt het model)
+        "positions": {},
+        "log": [],
+        "journal": [],
+    }
+
+
+def shadow_b_ensure(account: dict[str, Any]) -> None:
+    """Maak of herstel de shadow-state op oudere accounts (idempotent)."""
+    state = account.get("shadow_b")
+    if not isinstance(state, dict) or state.get("version") != SHADOW_B_VERSION:
+        account["shadow_b"] = _shadow_b_state()
+
+
+def _shadow_trim(entries: list[dict[str, Any]], max_len: int) -> None:
+    if len(entries) > max_len:
+        del entries[:-max_len]
+
+
+def _shadow_log(account: dict[str, Any], event: dict[str, Any]) -> None:
+    event = dict(event)
+    event.setdefault("at", None)
+    account["shadow_b"]["log"].append(event)
+    _shadow_trim(account["shadow_b"]["log"], SHADOW_B_MAX_LOG)
+
+
+def _shadow_r_from_price(tracker: dict[str, Any], price: float) -> float | None:
+    """R van een prijs t.o.v. entry; None zolang er geen SL-afstand is."""
+    sl = tracker.get("actual_sl")
+    if not sl:
+        return None
+    sl_dist = abs(tracker["entry_price"] - sl)
+    if sl_dist <= 0:
+        return None
+    direction = 1.0 if tracker["side"] == "long" else -1.0
+    return direction * (price - tracker["entry_price"]) / sl_dist
+
+
+def shadow_b_on_open(
+    account: dict[str, Any],
+    position: dict[str, Any],
+    now_iso: str,
+) -> None:
+    """Start een schaduwtracker voor een net geopende (echte) positie."""
+    shadow_b_ensure(account)
+    coin = str(position["coin"]).upper()
+    entry_price = float(position["entry_price"])
+    sl = position.get("stop_loss")
+    side = str(position["side"])
+    direction = 1.0 if side == "long" else -1.0
+    unit_fee = entry_price * TAKER_FEE_RATE * 2  # rondje taker-fees per unit
+    tracker = {
+        "coin": coin,
+        "side": side,
+        "entry_price": entry_price,
+        "actual_sl": sl,
+        "actual_tp": position.get("take_profit"),
+        "opened_at": now_iso,
+        "r_unit_usd": round(abs(entry_price - sl) * position["size"], 4) if sl else None,
+        "be_price": entry_price + direction * unit_fee,
+        "phase": 0,
+        "shadow_stop": sl,
+        "fav_price": entry_price,  # gunstigste prijs sinds entry
+        "mfe_r": 0.0,
+        "mae_r": 0.0,
+        "shadow_exit": None,
+    }
+    account["shadow_b"]["positions"][coin] = tracker
+    _shadow_log(
+        account,
+        {
+            "at": now_iso,
+            "type": "track-open",
+            "coin": coin,
+            "side": side,
+            "entry": entry_price,
+            "actual_sl": sl,
+            "r_unit_usd": tracker["r_unit_usd"],
+        },
+    )
+
+
+def shadow_b_on_close(
+    account: dict[str, Any],
+    coin: str,
+    exit_price: float,
+    now_iso: str,
+    real_reason: str,
+) -> None:
+    """Vergelijk een echte close met de ladder en journaliseer het resultaat."""
+    state = account.get("shadow_b")
+    if not isinstance(state, dict) or state.get("version") != SHADOW_B_VERSION:
+        return
+    tracker = state["positions"].pop(str(coin).upper(), None)
+    if tracker is None:
+        return
+    real_r = _shadow_r_from_price(tracker, float(exit_price))
+    shadow_exit = tracker.get("shadow_exit")
+    entry = {
+        "coin": tracker["coin"],
+        "side": tracker["side"],
+        "opened_at": tracker["opened_at"],
+        "closed_at": now_iso,
+        "reason": real_reason,
+        "r_unit_usd": tracker["r_unit_usd"],
+        "mfe_r": round(tracker["mfe_r"], 3),
+        "mae_r": round(tracker["mae_r"], 3),
+        "phase_at_close": tracker["phase"],
+        "shadow_stop_at_close": tracker.get("shadow_stop"),
+        "real_exit_price": exit_price,
+        "real_r": round(real_r, 3) if real_r is not None else None,
+        "shadow_exit": shadow_exit,
+        "shadow_r": shadow_exit.get("r") if shadow_exit else None,
+        "delta_r": None,
+        "comparison": "onbekend",
+    }
+    if tracker.get("r_unit_usd") is None:
+        entry["comparison"] = "geen-SL: ladder inactief"
+    elif shadow_exit:
+        entry["comparison"] = "ladder-eerst"
+        if entry["shadow_r"] is not None and real_r is not None:
+            entry["delta_r"] = round(entry["shadow_r"] - entry["real_r"], 3)
+    else:
+        # echte exit terwijl de ladder nog actief was: ladder zou langer
+        # hebben vastgehouden; het eindresultaat daarvan is onbekend.
+        entry["comparison"] = "echte-exit-eerst"
+    state["journal"].append(entry)
+    _shadow_trim(state["journal"], SHADOW_B_MAX_JOURNAL)
+    _shadow_log(
+        account,
+        {
+            "at": now_iso,
+            "type": "track-close",
+            "coin": tracker["coin"],
+            "reason": real_reason,
+            "real_r": entry["real_r"],
+            "shadow_exit": bool(shadow_exit),
+            "comparison": entry["comparison"],
+        },
+    )
+
+
+def shadow_b_update(
+    account: dict[str, Any],
+    prices: dict[str, float],
+    now_iso: str,
+) -> list[dict[str, Any]]:
+    """Voer de ladder één keer uit in shadow: trackers bijwerken, niets uitvoeren.
+
+    Aanroepen met verse prijzen in elke cyclus en in elke guard-stap. Retourneert
+    de schaduwevents van deze run (informatief, nooit echte engine-events).
+    """
+    shadow_b_ensure(account)
+    events: list[dict[str, Any]] = []
+    trackers = account["shadow_b"]["positions"]
+    for coin in sorted(list(trackers)):
+        tracker = trackers.get(coin)
+        position = account["positions"].get(coin)
+        price = prices.get(coin)
+        if tracker is None or position is None or price is None:
+            continue
+        if tracker.get("shadow_exit"):
+            continue  # ladder al uitgestapt; de echte trade loopt door
+        direction = 1.0 if tracker["side"] == "long" else -1.0
+        r = _shadow_r_from_price(tracker, price)
+        if r is not None:
+            tracker["mfe_r"] = max(tracker["mfe_r"], r)
+            tracker["mae_r"] = min(tracker["mae_r"], r)
+        if direction * (price - tracker["fav_price"]) > 0:
+            tracker["fav_price"] = price
+
+        sl_dist = None
+        if tracker.get("actual_sl"):
+            sl_dist = abs(tracker["entry_price"] - tracker["actual_sl"])
+
+        # 1) Exitcheck eerst (conservatief): raakt de prijs de ladder-SL?
+        stop = tracker.get("shadow_stop")
+        if stop is not None and direction * (price - stop) <= 0:
+            r_exit = _shadow_r_from_price(tracker, stop)
+            phase = tracker["phase"]
+            reason = "shadow-stop" if phase == 0 else (
+                "shadow-BE-lock" if phase == 1 else "shadow-trailing-stop"
+            )
+            exit_event = {
+                "at": now_iso,
+                "price": round(float(stop), 6),
+                "r": round(r_exit, 3) if r_exit is not None else None,
+                "phase": phase,
+                "reason": reason,
+            }
+            tracker["shadow_exit"] = exit_event
+            events.append({"type": "shadow-exit", "coin": coin, **exit_event})
+            _shadow_log(account, {"at": now_iso, "type": "shadow-exit", "coin": coin, **exit_event})
+            continue
+
+        # 2) Fase-upgrades daarna (alleen met een geldige SL-afstand en R).
+        if sl_dist and r is not None:
+            if tracker["phase"] == 0 and r >= 1.0:
+                tracker["phase"] = 1
+                tracker["shadow_stop"] = tracker["be_price"]
+                events.append({"type": "shadow-be-lock", "coin": coin, "at": now_iso,
+                               "level": round(tracker["be_price"], 6), "r": round(r, 3)})
+                _shadow_log(account, {"at": now_iso, "type": "be-lock", "coin": coin,
+                                      "level": round(tracker["be_price"], 6), "r": round(r, 3)})
+            if tracker["phase"] == 1 and r >= 2.0:
+                tracker["phase"] = 2
+                events.append({"type": "shadow-trailing-start", "coin": coin, "at": now_iso,
+                               "r": round(r, 3)})
+                _shadow_log(account, {"at": now_iso, "type": "trailing-start", "coin": coin,
+                                      "r": round(r, 3)})
+            if tracker["phase"] == 2:
+                trail_level = tracker["fav_price"] - direction * sl_dist
+                if direction * (trail_level - float(tracker["shadow_stop"])) > 0:
+                    tracker["shadow_stop"] = round(trail_level, 6)
+                    events.append({"type": "shadow-trail-update", "coin": coin, "at": now_iso,
+                                   "level": tracker["shadow_stop"]})
+                    _shadow_log(account, {"at": now_iso, "type": "trail-update", "coin": coin,
+                                          "level": tracker["shadow_stop"]})
+    return events
+
+
+def shadow_b_summary(account: dict[str, Any]) -> dict[str, Any]:
+    """Cumulatieve shadow-statistieken over het journaal (deterministisch)."""
+    state = account.get("shadow_b")
+    journal = state.get("journal", []) if isinstance(state, dict) else []
+    resolved = [j for j in journal if j.get("delta_r") is not None]
+    sum_real = sum(j["real_r"] for j in resolved)
+    sum_shadow = sum(j["shadow_r"] for j in resolved)
+    return {
+        "trades": len(journal),
+        "resolved": len(resolved),
+        "sum_real_r": round(sum_real, 3),
+        "sum_shadow_r": round(sum_shadow, 3),
+        "delta_r": round(sum_shadow - sum_real, 3),
+        "unresolved": len(journal) - len(resolved),
+    }
+
+
+def shadow_b_report_lines(account: dict[str, Any], prices: dict[str, float]) -> list[str]:
+    """Markdown-sectie voor het cyclusrapport (geen model-prompt-input)."""
+    state = account.get("shadow_b")
+    if not isinstance(state, dict) or state.get("version") != SHADOW_B_VERSION:
+        return []
+    trackers = state.get("positions") or {}
+    journal = state.get("journal") or []
+    if not trackers and not journal:
+        return []
+    lines = [
+        "## Shadow-exitladder (Upgrade B, meekijkend)",
+        "",
+        "*R-gebaseerd exit-systeem in test: logt wat de ladder zou doen "
+        "(BE-lock op +1R, trailing vanaf +2R) zonder iets uit te voeren. "
+        "Het model ziet deze data bewust niet, zodat de vergelijking zuiver blijft.*",
+        "",
+    ]
+    if trackers:
+        lines.append("| Coin | Richting | R nu | MFE-R | MAE-R | Fase | Shadow-SL | Status |")
+        lines.append("|---|---|---|---|---|---|---|---|")
+        for coin, tracker in sorted(trackers.items()):
+            price = prices.get(coin)
+            r_now = _shadow_r_from_price(tracker, price) if price else None
+            shadow_exit = tracker.get("shadow_exit")
+            status = (
+                f"schaduw-exit op {_fmt_price(shadow_exit['price'])} (r {shadow_exit['r']})"
+                if shadow_exit
+                else "ladder actief"
+            )
+            lines.append(
+                f"| {coin} | {tracker['side']} | {_fmt_num(r_now, 2)} | "
+                f"{_fmt_num(tracker['mfe_r'], 2)} | {_fmt_num(tracker['mae_r'], 2)} | "
+                f"{_SHADOW_PHASE_LABELS.get(tracker['phase'], tracker['phase'])} | "
+                f"{_fmt_price(tracker.get('shadow_stop')) if tracker.get('shadow_stop') else '-'} | {status} |"
+            )
+        lines.append("")
+    summary = shadow_b_summary(account)
+    if summary["resolved"]:
+        lines.append(
+            f"- **Vergelijking tot nu toe:** {summary['resolved']} vergeleken trades: "
+            f"echte exits {summary['sum_real_r']:+.2f} R vs ladder {summary['sum_shadow_r']:+.2f} R "
+            f"(**delta {summary['delta_r']:+.2f} R** voor de ladder), "
+            f"{summary['trades']} gejounnaalde trades totaal."
+        )
+    elif summary["trades"]:
+        lines.append(
+            f"- Nog geen volledig vergeleken trades ({summary['trades']} gejournalaal; "
+            "de vergelijking vult zich zodra ladder- en echte exit samenkomen)."
+        )
+    recent_log = (state.get("log") or [])[-3:]
+    if recent_log:
+        lines.append("- Laatste schaduwevents: " + "; ".join(
+            f"{e.get('type')} {e.get('coin', '')}".strip() for e in recent_log
+        ))
+    return lines
+
+
 def new_account(start_balance_usd: float, now_iso: str) -> dict[str, Any]:
     """Fresh paper account state (JSON-serializable, engine-owned)."""
     balance = float(start_balance_usd)
@@ -500,6 +821,7 @@ def new_account(start_balance_usd: float, now_iso: str) -> dict[str, Any]:
         "last_cycle_at": None,
         "halted": False,
         "halt_reason": None,
+        "shadow_b": _shadow_b_state(),
     }
 
 
@@ -715,6 +1037,7 @@ def open_position(
             "reason": str(action.get("rationale", ""))[:300],
         },
     )
+    shadow_b_on_open(account, position, now_iso)
     return {"type": "open", "coin": coin, "side": side, "price": price,
             "size": size, "leverage": leverage, "margin": margin, "fee": fee}
 
@@ -754,6 +1077,7 @@ def close_position(
             "reason": position.get("close_reason", ""),
         },
     )
+    shadow_b_on_close(account, coin, price, now_iso, reason)
     return {"type": "close", "coin": coin, "price": price, "pnl": pnl,
             "fee": fee, "reason": reason}
 
@@ -848,6 +1172,7 @@ def process_forced_exits(
                     "reason": "liquidatieprijs benaderd (gesimuleerd)",
                 },
             )
+            shadow_b_on_close(account, coin, liq, now_iso, "liquidated")
             events.append(
                 {"type": "liquidated", "coin": coin, "price": liq,
                  "pnl": -position["margin"], "reason": "liquidated"}
@@ -1495,6 +1820,7 @@ def render_cycle_report(
                 f"| {_fmt_signed(unrealized)} | {pos.get('stop_loss') or '-'} | {pos.get('take_profit') or '-'} |"
             )
         lines.append("")
+    lines.extend(shadow_b_report_lines(account, prices))
     lines.append("## Beslissingen")
     lines.append("")
     lines.append(f"**Marktbeeld:** {decision.get('market_view', '-')}")
