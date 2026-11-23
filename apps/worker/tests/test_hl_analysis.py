@@ -931,5 +931,140 @@ class ShadowLadderTests(unittest.TestCase):
         self.assertEqual(account["positions"]["BTC"]["take_profit"], 105.0)
 
 
+class SeedTests(unittest.TestCase):
+    """Seed-import/-export: historie terugzetten en rond Bowler bewaren."""
+
+    def _account_with_roundtrip(self):
+        account = fresh_account()
+        hl_analysis.apply_actions(
+            account,
+            [{"action": "open", "coin": "BTC", "direction": "long",
+              "leverage": 5, "margin_fraction": 0.10,
+              "stop_loss": 99.0, "take_profit": 105.0,
+              "rationale": "seed-test long"}],
+            PRICES, "2026-11-14T11:00:00+00:00", PARAMS, META,
+        )
+        hl_analysis.close_position(account, "BTC", 102.5, "2026-11-14T12:00:00+00:00", "close")
+        return account
+
+    def test_seed_roundtrip_preserves_everything(self):
+        account = self._account_with_roundtrip()
+        account["cycles"] = 42
+        account["halted"] = True
+        account["halt_reason"] = "test"
+        # shadow-meeting deed mee: 1 journalentry via een echte open+close
+        journal_before = list(account["shadow_b"]["journal"])
+        seed = hl_analysis.seed_from_account(account)
+        seeded = hl_analysis.account_from_seed(seed, "2026-11-15T09:00:00+00:00")
+
+        self.assertEqual(seeded["balance"], account["balance"])
+        self.assertEqual(seeded["realized_pnl"], account["realized_pnl"])
+        self.assertEqual(seeded["fees_paid"], account["fees_paid"])
+        self.assertEqual(seeded["cycles"], 42)
+        self.assertEqual(seeded["started_at"], account["started_at"])
+        self.assertEqual(seeded["halted"], True)
+        self.assertEqual(seeded["halt_reason"], "test")
+        self.assertEqual(seeded["trades"], account["trades"])
+        self.assertEqual(seeded["positions"], {})
+        self.assertEqual(seeded["shadow_b"]["journal"], journal_before)
+        self.assertEqual(
+            hl_analysis.performance_stats(seeded), hl_analysis.performance_stats(account)
+        )
+        self.assertEqual(
+            hl_analysis.learning_block(seeded), hl_analysis.learning_block(account)
+        )
+        # dagbasis van de actieve dag blijft overgedragen bij een roundtrip
+        self.assertEqual(seeded["day_key"], "2026-11-15")
+        self.assertEqual(seeded["day_start_equity"], account["day_start_equity"])
+
+    def test_seed_manual_history_import(self):
+        seed = {
+            "version": 1,
+            "balance": 990.29,
+            "realized_pnl": -5.67,
+            "fees_paid": 4.04,
+            "cycles": 173,
+            "started_at": "2026-11-15T12:10:00Z",
+            "equity_high": 1004.56,
+            "trades": [
+                {"coin": "BTC", "side": "long", "action": "open", "price": 100.0,
+                 "size": 5.0, "notional": 500.0, "leverage": 5, "margin": 100.0,
+                 "fee": 0.225, "at": "2026-11-16T10:05:00+00:00",
+                 "reason": "hersteld uit rapport na herstart"},
+                {"coin": "BTC", "side": "long", "action": "target", "price": 101.2,
+                 "size": 5.0, "notional": 506.0, "leverage": 5, "margin": 100.0,
+                 "pnl": 6.0, "fee": 0.227, "at": "2026-11-16T13:05:00+00:00",
+                 "reason": "take-profit geraakt"},
+            ],
+            "shadow_journal": [
+                {"coin": "BTC", "side": "long",
+                 "opened_at": "2026-11-16T10:05:00+00:00",
+                 "closed_at": "2026-11-16T13:05:00+00:00",
+                 "reason": "target", "r_unit_usd": 5.0, "mfe_r": 1.4, "mae_r": -0.2,
+                 "phase_at_close": 1, "shadow_stop_at_close": 100.09,
+                 "real_exit_price": 101.2, "real_r": 1.2, "shadow_exit": None,
+                 "shadow_r": None, "delta_r": None, "comparison": "echte-exit-eerst"},
+            ],
+        }
+        account = hl_analysis.account_from_seed(seed, "2026-11-23T06:20:00+00:00")
+        stats = hl_analysis.performance_stats(account)
+        self.assertEqual(stats["closed"], 1)
+        self.assertEqual(stats["wins"], 1)
+        self.assertAlmostEqual(stats["total_pnl"], 6.0)
+        self.assertEqual(stats["exits"], {"target": 1})
+        self.assertEqual(account["cycles"], 173)
+        self.assertEqual(account["started_at"], "2026-11-15T12:10:00+00:00")  # Z genormaliseerd
+        self.assertAlmostEqual(account["equity_high"], 1004.56)
+        self.assertAlmostEqual(account["balance"], 990.29)
+        self.assertEqual(len(account["shadow_b"]["journal"]), 1)
+        summary = hl_analysis.shadow_b_summary(account)
+        self.assertEqual(summary["trades"], 1)
+        self.assertEqual(summary["resolved"], 0)  # echte-exit-eerst = unresolved
+
+    def test_account_from_seed_rejects_incomplete_or_bad_rows(self):
+        base = {
+            "version": 1, "balance": 1000.0, "realized_pnl": 0.0, "fees_paid": 0.0,
+        }
+        # balance/realized_pnl/fees_paid zijn verplicht
+        with self.assertRaises(ValueError):
+            hl_analysis.account_from_seed({"version": 1}, "t")
+        # ongeldige actie
+        bad_action = dict(base, trades=[
+            {"coin": "BTC", "side": "long", "action": "buy", "price": 100.0,
+             "size": 1.0, "leverage": 5, "fee": 0.0, "at": "2026-11-16T10:05:00+00:00"},
+        ])
+        with self.assertRaises(ValueError):
+            hl_analysis.account_from_seed(bad_action, "t")
+        # ongeldige timestamp
+        bad_time = dict(base, trades=[
+            {"coin": "BTC", "side": "long", "action": "open", "price": 100.0,
+             "size": 1.0, "leverage": 5, "fee": 0.0, "at": "gisteren"},
+        ])
+        with self.assertRaises(ValueError):
+            hl_analysis.account_from_seed(bad_time, "t")
+        # close-rij zonder pnl
+        no_pnl = dict(base, trades=[
+            {"coin": "BTC", "side": "long", "action": "open", "price": 100.0,
+             "size": 1.0, "leverage": 5, "fee": 0.0, "at": "2026-11-16T10:05:00+00:00"},
+            {"coin": "BTC", "side": "long", "action": "close", "price": 101.0,
+             "size": 1.0, "leverage": 5, "fee": 0.0, "at": "2026-11-16T11:05:00+00:00"},
+        ])
+        with self.assertRaises(ValueError):
+            hl_analysis.account_from_seed(no_pnl, "t")
+        # onbekende seed-versie
+        with self.assertRaises(ValueError):
+            hl_analysis.account_from_seed(dict(base, version=99), "t")
+        # geen object
+        with self.assertRaises(ValueError):
+            hl_analysis.account_from_seed(["geen", "object"], "t")
+
+    def test_seed_never_carries_positions(self):
+        account = self._account_with_roundtrip()
+        seed = hl_analysis.seed_from_account(account)
+        self.assertNotIn("positions", seed)
+        seeded = hl_analysis.account_from_seed(seed, "t")
+        self.assertEqual(seeded["positions"], {})
+
+
 if __name__ == "__main__":
     unittest.main()
