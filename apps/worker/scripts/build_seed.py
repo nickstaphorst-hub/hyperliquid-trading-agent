@@ -111,7 +111,7 @@ shadow_journal = [
      "opened_at": "2026-11-22T09:07:01+00:00", "closed_at": "2026-11-22T10:06:52+00:00",
      "reason": "close", "r_unit_usd": 5.0455, "mfe_r": 0.864, "mae_r": 0.0,
      "phase_at_close": 0, "shadow_stop_at_close": 58500,
-     "real_exit_price": 61024.5, "real_r": None, "shadow_exit": None,
+     "real_exit_price": 61024.5, "real_r": 1.063, "shadow_exit": None,
      "shadow_r": None, "delta_r": None, "comparison": "echte-exit-eerst"},
 ]
 
