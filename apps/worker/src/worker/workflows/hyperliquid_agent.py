@@ -38,6 +38,12 @@ TRADING_MODES = ("paper",)  # live is deliberately not supported (yet)
 
 _RETRYABLE_STATUS = {429, 500, 502, 503, 504}
 
+# Feature-detection: oudere SDK's kennen continue-as-new nog niet. Dan draait
+# de agent gewoon door zonder history-reset, net als voorheen.
+_HAS_CONTINUE_AS_NEW = hasattr(workflows.workflow, "continue_as_new") and hasattr(
+    workflows.workflow, "should_continue_as_new"
+)
+
 _INTERVAL_MS = {
     "15m": 15 * 60 * 1000,
     "1h": 60 * 60 * 1000,
@@ -68,6 +74,15 @@ class AgentInput(BaseModel):
     cycle_minute: int = Field(default=5, ge=0, le=59)
     guard_seconds: int = Field(default=900, ge=0, le=3600)  # 0 = guard uit
     trading_mode: str = "paper"
+    seed: dict | None = Field(
+        default=None,
+        description=(
+            "Optionele historie-import (account-snapshot) om de run mee te "
+            "starten: trades, shadow-journaal, balance, lessen-context. "
+            "Strikt gevalideerd door hl_analysis.account_from_seed; bij een "
+            "foutieve seed faalt de start duidelijk in plaats van stil."
+        ),
+    )
 
 
 class TradeAction(BaseModel):
@@ -223,11 +238,9 @@ async def fetch_news_feeds() -> dict[str, str]:
     name="hyperliquid-trading-agent",
     workflow_display_name="Hyperliquid Trading Agent",
     # The platform default execution_timeout is 1 hour; this agent is a
-    # long-running loop, so it opts into a full year. Note the execution
-    # history cap (~51,200 events) is only reached after ~1,5 year at the
-    # default 4h cadence; when that horizon gets closer, add the
-    # Continue-As-New pattern to reset the history while carrying the
-    # account state forward.
+    # long-running loop, so it opts into a full year. When the event history
+    # nears its cap the loop continues-as-new with the full account state as
+    # seed, so a fresh execution takes over without losing any memory.
     execution_timeout=timedelta(days=365),
     workflow_description=(
         "Duurzame paper-trading-agent voor Hyperliquid perpetuals met leverage "
@@ -436,7 +449,16 @@ class HyperliquidTradingAgent:
 
         now = await now_utc()
         self.started_at = now
-        self.account = hl_analysis.new_account(input.start_balance_usd, now)
+        if input.seed:
+            # Historie-import: het account (trades, shadow-journaal, lessen-
+            # context, balance) komt terug uit een snapshot van een eerdere
+            # run. Strikte validatie; een slechte seed laat de start duidelijk
+            # falen zodat er nooit stilletjes half gestart wordt.
+            self.account = hl_analysis.account_from_seed(
+                input.seed, now, input.start_balance_usd
+            )
+        else:
+            self.account = hl_analysis.new_account(input.start_balance_usd, now)
         self.last_cycle = None
         self.last_error = None
 
@@ -451,4 +473,23 @@ class HyperliquidTradingAgent:
                 await self._run_cycle(input)
             except Exception as exc:  # noqa: BLE001 - the loop must survive
                 self.last_error = f"{type(exc).__name__}: {exc}"
+
+            # History-bescherming: zodra de event-hist van deze executie bijna
+            # vol is, start een verse run met het account als seed (continue-
+            # as-new, alleen mogelijk zonder open posities). Zo kan de agent
+            # in principe onbeperkt doorlopen en blijft het geheugen bewaard.
+            if (
+                _HAS_CONTINUE_AS_NEW
+                and not self.account.get("positions")
+                and workflows.workflow.should_continue_as_new()
+            ):
+                workflows.workflow.continue_as_new(
+                    input.model_copy(
+                        update={
+                            "seed": hl_analysis.seed_from_account(self.account),
+                        }
+                    )
+                )
+                return
+
             await self._sleep_to_next_cycle(input)

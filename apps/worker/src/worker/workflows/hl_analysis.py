@@ -804,6 +804,234 @@ def shadow_b_report_lines(account: dict[str, Any], prices: dict[str, float]) -> 
     return lines
 
 
+# ---------------------------------------------------------------------------
+# Seed: compacte account-snapshot voor herstart en continue-as-new
+# ---------------------------------------------------------------------------
+
+SEED_VERSION = 1
+SEED_ACTIONS = ("open", "close", "stop", "target", "liquidated")
+
+
+def seed_from_account(account: dict[str, Any]) -> dict[str, Any]:
+    """Compacte, JSON-serisaliseerbare snapshot van het account.
+
+    Bedoeld als slaapstand die twee kanten op werkt: :func:`account_from_seed`
+    bouwt er een identiek draaiend account mee terug, en de workflow gebruikt
+    hem als carry-forward state bij continue-as-new (history-reset) en als
+    handmatige historie-import na een beëindigde run. Open posities horen
+    bewust niet in een seed: seed-herstel gebeurt altijd plat.
+    """
+    state = account.get("shadow_b") or {}
+    return {
+        "version": SEED_VERSION,
+        "balance": float(account["balance"]),
+        "realized_pnl": float(account["realized_pnl"]),
+        "fees_paid": float(account["fees_paid"]),
+        "cycles": int(account.get("cycles") or 0),
+        "started_at": account.get("started_at") or None,
+        "equity_high": max(
+            float(account.get("equity_high") or 0.0), float(account["balance"])
+        ),
+        "day_start_equity": float(account.get("day_start_equity") or 0.0) or None,
+        "halted": bool(account.get("halted", False)),
+        "halt_reason": account.get("halt_reason") or None,
+        "trades": [dict(t) for t in (account.get("trades") or [])],
+        "shadow_journal": [dict(j) for j in (state.get("journal") or [])],
+        "shadow_log": [dict(e) for e in (state.get("log") or [])[-SHADOW_B_MAX_LOG:]],
+    }
+
+
+def account_from_seed(
+    seed: dict[str, Any],
+    now_iso: str,
+    start_balance_usd: float = 1000.0,
+) -> dict[str, Any]:
+    """Reconstrueer een paper-account uit een seed (historie-import).
+
+    Alle regels worden streng gevalideerd: een onvolledige of inconsistente
+    seed gooit een duidelijke ValueError in plaats van stilletjes half te
+    starten. Positions zijn nooit seedbaar (herstel gebeurt plat);
+    ``shadow_journal`` is optioneel, ``cycles``/``started_at``/``equity_high``
+    zetten de historie van het experiment voort.
+    """
+    if not isinstance(seed, dict):
+        raise ValueError("seed moet een JSON-object zijn")
+    try:
+        version = int(seed.get("version", SEED_VERSION))
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"seed['version'] is geen getal: {exc}") from exc
+    if version != SEED_VERSION:
+        raise ValueError(f"onbekende seed-versie: {version} (verwacht {SEED_VERSION})")
+
+    trades = seed.get("trades", [])
+    if not isinstance(trades, list):
+        raise ValueError("seed['trades'] moet een lijst zijn")
+    journal = seed.get("shadow_journal", [])
+    if journal is None:
+        journal = []
+    if not isinstance(journal, list):
+        raise ValueError("seed['shadow_journal'] moet een lijst zijn")
+
+    account = new_account(
+        _seed_float(seed.get("start_balance", start_balance_usd), "seed.start_balance", minimum=0.0),
+        now_iso,
+    )
+    account["trades"] = [_seed_trade_row(raw, i) for i, raw in enumerate(trades)]
+
+    account["balance"] = _seed_float(seed.get("balance"), "seed.balance")
+    account["realized_pnl"] = _seed_float(seed.get("realized_pnl"), "seed.realized_pnl")
+    account["fees_paid"] = _seed_float(seed.get("fees_paid"), "seed.fees_paid", minimum=0.0)
+    account["cycles"] = int(
+        _seed_float(seed.get("cycles", 0), "seed.cycles", minimum=0.0)
+    )
+    started_at = seed.get("started_at")
+    if started_at:
+        account["started_at"] = _seed_iso(started_at, "seed.started_at")
+    equity_high = seed.get("equity_high")
+    account["equity_high"] = max(
+        _seed_float(equity_high, "seed.equity_high") if equity_high is not None else account["balance"],
+        account["balance"],
+    )
+    day_start_equity = seed.get("day_start_equity")
+    account["day_start_equity"] = (
+        _seed_float(day_start_equity, "seed.day_start_equity")
+        if day_start_equity is not None
+        else account["balance"]
+    )
+    account["day_key"] = day_key(now_iso)
+    account["halted"] = bool(seed.get("halted", False))
+    account["halt_reason"] = seed.get("halt_reason") or None
+
+    shadow_b_ensure(account)
+    if journal:
+        account["shadow_b"]["journal"] = [
+            _seed_shadow_entry(raw, i) for i, raw in enumerate(journal)
+        ]
+    shadow_log = seed.get("shadow_log") or []
+    if isinstance(shadow_log, list) and shadow_log:
+        account["shadow_b"]["log"] = [dict(e) for e in shadow_log]
+    return account
+
+
+def _seed_float(value: Any, field: str, minimum: float | None = None) -> float:
+    """Strikte float-validatie voor seed-velden (geen bools, geen NaN/inf)."""
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise ValueError(f"{field} moet een getal zijn, got: {value!r}")
+    number = float(value)
+    if not math.isfinite(number):
+        raise ValueError(f"{field} moet eindig zijn, got: {value!r}")
+    if minimum is not None and number < minimum:
+        raise ValueError(f"{field} moet >= {minimum} zijn, got: {number!r}")
+    return number
+
+
+def _seed_iso(value: Any, field: str) -> str:
+    """Valideer een ISO-timestamp en normaliseer 'Z' naar '+00:00'."""
+    text = str(value or "").strip()
+    if text.endswith("Z"):
+        text = text[:-1] + "+00:00"
+    try:
+        datetime.fromisoformat(text)
+    except ValueError as exc:
+        raise ValueError(f"{field} is geen geldige ISO-timestamp: {value!r}") from exc
+    return text
+
+
+def _seed_trade_row(raw: Any, index: int) -> dict[str, Any]:
+    """Valideer en normaliseer één journal-rij uit een seed."""
+    where = f"seed['trades'][{index}]"
+    if not isinstance(raw, dict):
+        raise ValueError(f"{where} moet een object zijn")
+    coin = str(raw.get("coin") or "").upper().strip()
+    if not coin:
+        raise ValueError(f"{where}: 'coin' ontbreekt")
+    side = str(raw.get("side") or "").lower()
+    if side not in ("long", "short"):
+        raise ValueError(f"{where}: 'side' moet 'long' of 'short' zijn, got: {side!r}")
+    action = str(raw.get("action") or "").lower()
+    if action not in SEED_ACTIONS:
+        raise ValueError(
+            f"{where}: 'action' moet een van {SEED_ACTIONS} zijn, got: {action!r}"
+        )
+    price = _seed_float(raw.get("price"), f"{where}.price", minimum=0.0)
+    if price <= 0:
+        raise ValueError(f"{where}.price moet > 0 zijn")
+    size = _seed_float(raw.get("size"), f"{where}.size", minimum=0.0)
+    if size <= 0:
+        raise ValueError(f"{where}.size moet > 0 zijn")
+    leverage = int(_seed_float(raw.get("leverage", 1), f"{where}.leverage", minimum=1.0))
+    margin = _seed_float(raw.get("margin", 0.0), f"{where}.margin", minimum=0.0)
+    fee = _seed_float(raw.get("fee", 0.0), f"{where}.fee", minimum=0.0)
+    notional = raw.get("notional")
+    if notional is None:
+        notional = price * size
+    pnl = None
+    if action != "open":
+        pnl = _seed_float(raw.get("pnl"), f"{where}.pnl")
+    return {
+        "coin": coin,
+        "side": side,
+        "action": action,
+        "price": price,
+        "size": size,
+        "notional": _seed_float(notional, f"{where}.notional", minimum=0.0),
+        "leverage": leverage,
+        "margin": margin,
+        "pnl": pnl,
+        "fee": fee,
+        "at": _seed_iso(raw.get("at"), f"{where}.at"),
+        "reason": str(raw.get("reason") or "")[:300],
+    }
+
+
+def _seed_shadow_entry(raw: Any, index: int) -> dict[str, Any]:
+    """Valideer en normaliseer één shadow-journaal-entry uit een seed."""
+    where = f"seed['shadow_journal'][{index}]"
+    if not isinstance(raw, dict):
+        raise ValueError(f"{where} moet een object zijn")
+    coin = str(raw.get("coin") or "").upper().strip()
+    if not coin:
+        raise ValueError(f"{where}: 'coin' ontbreekt")
+    side = str(raw.get("side") or "").lower()
+    if side not in ("long", "short"):
+        raise ValueError(f"{where}: 'side' moet 'long' of 'short' zijn, got: {side!r}")
+    opened_at = _seed_iso(raw.get("opened_at"), f"{where}.opened_at")
+    closed_at = _seed_iso(raw.get("closed_at"), f"{where}.closed_at")
+    shadow_exit = raw.get("shadow_exit")
+    if shadow_exit is not None and not isinstance(shadow_exit, dict):
+        raise ValueError(f"{where}.shadow_exit moet een object of null zijn")
+    entry = {
+        "coin": coin,
+        "side": side,
+        "opened_at": opened_at,
+        "closed_at": closed_at,
+        "reason": str(raw.get("reason") or ""),
+        "r_unit_usd": _opt_seed_float(raw.get("r_unit_usd"), f"{where}.r_unit_usd"),
+        "mfe_r": _opt_seed_float(raw.get("mfe_r"), f"{where}.mfe_r") or 0.0,
+        "mae_r": _opt_seed_float(raw.get("mae_r"), f"{where}.mae_r") or 0.0,
+        "phase_at_close": int(
+            _seed_float(raw.get("phase_at_close", 0), f"{where}.phase_at_close", minimum=0.0)
+        ),
+        "shadow_stop_at_close": _opt_seed_float(
+            raw.get("shadow_stop_at_close"), f"{where}.shadow_stop_at_close"
+        ),
+        "real_exit_price": _seed_float(raw.get("real_exit_price"), f"{where}.real_exit_price"),
+        "real_r": _opt_seed_float(raw.get("real_r"), f"{where}.real_r"),
+        "shadow_exit": dict(shadow_exit) if shadow_exit else None,
+        "shadow_r": _opt_seed_float(raw.get("shadow_r"), f"{where}.shadow_r"),
+        "delta_r": _opt_seed_float(raw.get("delta_r"), f"{where}.delta_r"),
+        "comparison": str(raw.get("comparison") or "onbekend"),
+    }
+    return entry
+
+
+def _opt_seed_float(value: Any, field: str) -> float | None:
+    """Optioneel seed-getal: None en afwezig zijn geldig, anders strikt."""
+    if value is None:
+        return None
+    return _seed_float(value, field)
+
+
 def new_account(start_balance_usd: float, now_iso: str) -> dict[str, Any]:
     """Fresh paper account state (JSON-serializable, engine-owned)."""
     balance = float(start_balance_usd)
