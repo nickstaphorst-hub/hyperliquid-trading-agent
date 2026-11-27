@@ -805,11 +805,182 @@ def shadow_b_report_lines(account: dict[str, Any], prices: dict[str, float]) -> 
 
 
 # ---------------------------------------------------------------------------
+# Live trailing-ladder (v2 exit-engine; promotie van Upgrade B)
+#
+# In v2 (``exit_engine == "ladder"``) beheert de ladder de exits ZELF, in
+# plaats van alleen model-close/SL/TP. 1R = initiële SL-afstand x size (USD).
+#   - uPnL >= be_lock_r (default +1R): SL naar breakeven + rondje fees
+#   - uPnL >= trail_start_r (default +2R): SL trailt trail_dist_r (default
+#     1R) achter de gunstigste prijs
+#   - optioneel tp_r: take-profit op entry + tp_r x SL-afstand (engine legt
+#     die bij de open over het model-TP heen, 0 = uit)
+# De ladder wijzigt de ECHTE stop_loss van de positie en sluit bij een
+# ladder-stop via de gewone engine (fees, balans en journaal kloppen daardoor
+# gewoon). Alle knoppen zitten in de run-input zodat zonder herdeploy te
+# tunen is. In v1-modus (``exit_engine == "model"``) gebeurt hier niets.
+# ---------------------------------------------------------------------------
+
+LADDER_VERSION = 1
+
+_LADDER_PHASE_LABELS = {0: "initieel", 1: "BE-lock", 2: "trailing"}
+
+# Exit-redenen die als "stop-type" tellen voor de cooldown-regel (v2).
+STOP_REASONS = ("stop", "ladder-stop", "ladder-be-lock", "ladder-trailing-stop")
+
+_LADDER_REASON_BY_PHASE = {0: "ladder-stop", 1: "ladder-be-lock", 2: "ladder-trailing-stop"}
+
+
+def ladder_cfg_from_params(params: dict[str, Any]) -> dict[str, float]:
+    """Normaliseer de ladder-knoppen uit ``params`` (defaults = v1-shadow)."""
+    cfg = params.get("ladder_cfg") if isinstance(params.get("ladder_cfg"), dict) else {}
+    return {
+        "be_lock_r": max(0.1, float(cfg.get("be_lock_r", 1.0))),
+        "trail_start_r": max(0.2, float(cfg.get("trail_start_r", 2.0))),
+        "trail_dist_r": max(0.1, float(cfg.get("trail_dist_r", 1.0))),
+        "tp_r": max(0.0, float(cfg.get("tp_r", 0.0))),
+    }
+
+
+def ladder_state_for(position: dict[str, Any]) -> dict[str, Any] | None:
+    """Ladder-tracking voor een net geopende positie; None zonder SL."""
+    sl = position.get("stop_loss")
+    entry_price = float(position["entry_price"])
+    if not sl:
+        return None
+    direction = 1.0 if position["side"] == "long" else -1.0
+    unit_fee = entry_price * TAKER_FEE_RATE * 2  # rondje taker-fees per unit
+    return {
+        "version": LADDER_VERSION,
+        "phase": 0,
+        "entry_price": entry_price,
+        "sl_dist": abs(entry_price - float(sl)),
+        "r_unit_usd": round(abs(entry_price - float(sl)) * position["size"], 4),
+        "be_price": entry_price + direction * unit_fee,
+        "fav_price": entry_price,
+        "mfe_r": 0.0,
+        "mae_r": 0.0,
+        "opened_at": position.get("opened_at"),
+    }
+
+
+def ladder_r(price: float, state: dict[str, Any]) -> float | None:
+    """R van een prijs t.o.v. entry; None zonder geldige SL-afstand."""
+    sl_dist = float(state.get("sl_dist") or 0.0)
+    if sl_dist <= 0:
+        return None
+    direction = 1.0 if state["side"] == "long" else -1.0
+    return direction * (price - state["entry_price"]) / sl_dist
+
+
+def ladder_manage_exits(
+    account: dict[str, Any],
+    prices: dict[str, float],
+    now_iso: str,
+    params: dict[str, Any],
+) -> list[dict[str, Any]]:
+    """Voer de live ladder één keer uit: fase-upgrades, trail-updates, stops.
+
+    Aanroepen met verse prijzen vóór de model-acties (net als
+    ``process_forced_exits``). Retourneert engine-events (echte closes en
+    ladder-mutaties) voor het cyclusrapport.
+    """
+    if params.get("exit_engine") != "ladder":
+        return []
+    cfg = ladder_cfg_from_params(params)
+    events: list[dict[str, Any]] = []
+    for coin in sorted(list(account["positions"])):
+        position = account["positions"].get(coin)
+        state = (position or {}).get("ladder_state")
+        price = prices.get(coin)
+        if position is None or state is None or price is None:
+            continue
+        state["side"] = position["side"]  # gemak voor ladder_r
+        direction = 1.0 if position["side"] == "long" else -1.0
+        r = ladder_r(price, state)
+        if r is not None:
+            state["mfe_r"] = max(state["mfe_r"], r)
+            state["mae_r"] = min(state["mae_r"], r)
+        if direction * (price - state["fav_price"]) > 0:
+            state["fav_price"] = price
+
+        # 1) Exitcheck eerst (conservatief): raakt de prijs de ladder-SL?
+        stop = position.get("stop_loss")
+        if stop is not None and direction * (price - stop) <= 0:
+            reason = _LADDER_REASON_BY_PHASE.get(state["phase"], "ladder-stop")
+            position["close_reason"] = f"ladder-stop (fase {state['phase']})"
+            events.append(close_position(account, coin, float(stop), now_iso, reason))
+            continue
+
+        # 2) Fase-upgrades daarna (alleen met een geldige R).
+        if r is None:
+            continue
+        if state["phase"] == 0 and r >= cfg["be_lock_r"]:
+            state["phase"] = 1
+            position["stop_loss"] = state["be_price"]
+            events.append({
+                "type": "ladder-be-lock", "coin": coin, "at": now_iso,
+                "level": round(state["be_price"], 6), "r": round(r, 3),
+            })
+        if state["phase"] == 1 and r >= cfg["trail_start_r"]:
+            state["phase"] = 2
+            events.append({
+                "type": "ladder-trailing-start", "coin": coin, "at": now_iso,
+                "r": round(r, 3),
+            })
+        if state["phase"] == 2:
+            trail_level = state["fav_price"] - direction * cfg["trail_dist_r"] * state["sl_dist"]
+            current = position.get("stop_loss")
+            if current is None or direction * (trail_level - current) > 0:
+                position["stop_loss"] = round(trail_level, 6)
+                events.append({
+                    "type": "ladder-trail-update", "coin": coin, "at": now_iso,
+                    "level": position["stop_loss"],
+                })
+    return events
+
+
+def ladder_report_lines(account: dict[str, Any], prices: dict[str, float]) -> list[str]:
+    """Markdown-sectie over de actieve ladder-posities voor het rapport."""
+    states = [
+        (coin, pos, pos.get("ladder_state"))
+        for coin, pos in sorted(account.get("positions", {}).items())
+        if pos.get("ladder_state")
+    ]
+    if not states:
+        return []
+    lines = [
+        "## Trailing-ladder (v2 exit-engine, live)",
+        "",
+        "*BE-lock op +be_lock_r, trailing vanaf +trail_start_r; de engine "
+        "beheert de stops zelf.*",
+        "",
+        "| Coin | Richting | R nu | MFE-R | MAE-R | Fase | Ladder-SL |",
+        "|---|---|---|---|---|---|---|",
+    ]
+    for coin, pos, state in states:
+        state = dict(state)
+        state["side"] = pos["side"]
+        price = prices.get(coin)
+        r_now = ladder_r(price, state) if price else None
+        lines.append(
+            f"| {coin} | {pos['side']} | {_fmt_num(r_now, 2)} | "
+            f"{_fmt_num(state['mfe_r'], 2)} | {_fmt_num(state['mae_r'], 2)} | "
+            f"{_LADDER_PHASE_LABELS.get(state['phase'], state['phase'])} | "
+            f"{_fmt_price(pos.get('stop_loss'))} |"
+        )
+    lines.append("")
+    return lines
+
+
+# ---------------------------------------------------------------------------
 # Seed: compacte account-snapshot voor herstart en continue-as-new
 # ---------------------------------------------------------------------------
 
 SEED_VERSION = 1
-SEED_ACTIONS = ("open", "close", "stop", "target", "liquidated")
+SEED_ACTIONS = (
+    "open", "close", "stop", "target", "liquidated",
+    "ladder-stop", "ladder-be-lock", "ladder-trailing-stop",
+)
 
 
 def seed_from_account(account: dict[str, Any]) -> dict[str, Any]:
@@ -968,6 +1139,13 @@ def _seed_trade_row(raw: Any, index: int) -> dict[str, Any]:
     pnl = None
     if action != "open":
         pnl = _seed_float(raw.get("pnl"), f"{where}.pnl")
+    lessons_raw = raw.get("lessons")
+    if lessons_raw is not None:
+        if not isinstance(lessons_raw, list):
+            raise ValueError(f"{where}.lessons moet een lijst zijn")
+        lessons = [str(lesson)[:300] for lesson in lessons_raw][:MAX_LESSONS]
+    else:
+        lessons = None
     return {
         "coin": coin,
         "side": side,
@@ -981,6 +1159,7 @@ def _seed_trade_row(raw: Any, index: int) -> dict[str, Any]:
         "fee": fee,
         "at": _seed_iso(raw.get("at"), f"{where}.at"),
         "reason": str(raw.get("reason") or "")[:300],
+        **({"lessons": lessons} if lessons else {}),
     }
 
 
@@ -1156,6 +1335,14 @@ def validate_action(
     if account.get("halted"):
         return False, f"nieuwe entries geblokkeerd: {account.get('halt_reason', 'circuit breaker')}"
 
+    # --- v2 harde risicoregels (alleen actief met hard_risk_rules) ---
+    hard = bool(params.get("hard_risk_rules"))
+    if hard and account.get("last_stop_cycle") == account.get("cycles"):
+        return False, (
+            "cooldown: deze cyclus is een stop-type exit geweest, "
+            "nieuwe entries pas weer in de volgende cyclus"
+        )
+
     leverage = action.get("leverage")
     if not isinstance(leverage, int) or isinstance(leverage, bool):
         return False, "leverage moet een geheel getal zijn"
@@ -1172,9 +1359,16 @@ def validate_action(
     if not isinstance(margin_fraction, (int, float)) or isinstance(margin_fraction, bool):
         return False, "margin_fraction moet een getal zijn"
     margin_fraction = float(margin_fraction)
-    if margin_fraction <= 0 or margin_fraction > float(params["max_margin_fraction"]):
+    margin_cap = float(params["max_margin_fraction"])
+    if hard:
+        streak = int(
+            params.get("margin_throttle_streak", 3)
+        )
+        if performance_stats(account).get("loss_streak_now", 0) >= streak:
+            margin_cap *= 0.5  # marge-throttle: verliesreeks -> halve limiet
+    if margin_fraction <= 0 or margin_fraction > margin_cap:
         return False, (
-            f"margin_fraction {margin_fraction} buiten (0, {params['max_margin_fraction']}]"
+            f"margin_fraction {margin_fraction} buiten (0, {margin_cap}]"
         )
 
     if circuit_breaker_tripped(account, prices, params["daily_loss_limit_pct"]):
@@ -1203,6 +1397,36 @@ def validate_action(
             return False, "take_profit voor een long moet boven de prijs liggen"
         if side == "short" and target >= prices[coin]:
             return False, "take_profit voor een short moet onder de prijs liggen"
+
+    if hard:
+        # SL en TP zijn in v2 verplicht: zonder beide geen R:R en geen
+        # fee-throttle te berekenen.
+        if stop is None:
+            return False, "hard_risk_rules: een open zonder stop_loss is geweigerd"
+        if target is None:
+            return False, "hard_risk_rules: een open zonder take_profit is geweigerd"
+        min_rr = max(0.0, float(params.get("min_rr", 1.2)))
+        sl_dist = abs(prices[coin] - stop)
+        tp_dist = abs(target - prices[coin])
+        if sl_dist <= 0:
+            return False, "hard_risk_rules: SL-afstand moet > 0 zijn"
+        if tp_dist / sl_dist < min_rr:
+            return False, (
+                f"hard_risk_rules: R:R {tp_dist / sl_dist:.2f} onder minimum {min_rr}"
+            )
+        # Fee-throttle: verwachte brutowinst (TP-afstand) moet ruim boven de
+        # round-trip fees uitkomen, anders is churn netto verlies.
+        equity = account_equity(account, prices)
+        notional = margin_fraction * equity * leverage
+        size = notional / prices[coin]
+        roundtrip_fee = notional * 2.0 * TAKER_FEE_RATE
+        expected_gain = tp_dist * size
+        gain_multiple = max(1.0, float(params.get("fee_gain_multiple", 3.0)))
+        if expected_gain <= gain_multiple * roundtrip_fee:
+            return False, (
+                f"fee-throttle: verwachte winst {expected_gain:.2f} USD is niet "
+                f"> {gain_multiple:.0f}x de round-trip fees ({roundtrip_fee:.2f} USD)"
+            )
     return True, "ok"
 
 
@@ -1235,6 +1459,12 @@ def open_position(
     account["fees_paid"] += fee
     stop = _to_float(action.get("stop_loss"))
     target = _to_float(action.get("take_profit"))
+    # v2 ladder-modus: tp_r-knop legt een R-gebaseerd TP over het model heen
+    # (0 = uit; dan blijft het model-TP staan). De SL-afstand blijft leidend.
+    tp_override = _to_float(action.get("_tp_override"))
+    if tp_override is not None and stop is not None:
+        direction = 1.0 if str(action.get("direction", "long")).lower() == "long" else -1.0
+        target = price + direction * tp_override * abs(price - stop)
     position = {
         "coin": coin,
         "side": side,
@@ -1247,6 +1477,13 @@ def open_position(
         "take_profit": target,
         "opened_at": now_iso,
     }
+    ladder_state = action.get("_ladder_state")
+    if isinstance(ladder_state, dict):
+        position["ladder_state"] = dict(ladder_state)
+    # Les-effectiviteit (v2): welke lessen waren actief bij de entry?
+    active_lessons = [
+        str(lesson)[:300] for lesson in (action.get("_active_lessons") or [])
+    ][:MAX_LESSONS]
     account["positions"][coin] = position
     _record_trade(
         account,
@@ -1263,6 +1500,7 @@ def open_position(
             "fee": fee,
             "at": now_iso,
             "reason": str(action.get("rationale", ""))[:300],
+            **({"lessons": active_lessons} if active_lessons else {}),
         },
     )
     shadow_b_on_open(account, position, now_iso)
@@ -1287,6 +1525,9 @@ def close_position(
     account["balance"] += position["margin"] + pnl - fee
     account["fees_paid"] += fee
     account["realized_pnl"] += pnl
+    if reason in STOP_REASONS:
+        # v2 cooldown-regel: in deze cyclus geen nieuwe entries meer.
+        account["last_stop_cycle"] = account.get("cycles")
     del account["positions"][coin]
     _record_trade(
         account,
@@ -1348,6 +1589,27 @@ def apply_actions(
         else:
             action = dict(action)
             action["_equity"] = account_equity(account, prices)
+            if params.get("exit_engine") == "ladder":
+                # v2: ladder-state meenemen en actieve lessen vastleggen voor
+                # de les-effectiviteitsmeting; tp_r legt eventueel een
+                # R-gebaseerd TP over het model-TP heen.
+                cfg = ladder_cfg_from_params(params)
+                if cfg["tp_r"] > 0 and action.get("stop_loss") is not None:
+                    action["_tp_override"] = cfg["tp_r"]
+                probe_position = {
+                    "side": str(action.get("direction", "long")).lower(),
+                    "entry_price": prices[coin],
+                    "size": 1.0,
+                    "stop_loss": _to_float(action.get("stop_loss")),
+                    "take_profit": _to_float(action.get("take_profit")),
+                    "opened_at": now_iso,
+                }
+                state = ladder_state_for(probe_position)
+                if state is not None:
+                    action["_ladder_state"] = state
+            if params.get("hard_risk_rules"):
+                stats = performance_stats(account)
+                action["_active_lessons"] = learning_lessons(stats)
             events.append(
                 open_position(account, action, prices[coin], now_iso)
             )
@@ -1514,6 +1776,9 @@ _EXIT_LABELS = {
     "stop": "stop-loss",
     "target": "take-profit",
     "liquidated": "LIQUIDATIE",
+    "ladder-stop": "ladder-stop",
+    "ladder-be-lock": "ladder-BE-lock",
+    "ladder-trailing-stop": "ladder-trailing-stop",
 }
 
 
@@ -1884,6 +2149,39 @@ def events_block(events: list[dict[str, Any]]) -> str:
     return "\n".join(lines)
 
 
+def exit_rules_lines(params: dict[str, Any]) -> str:
+    """V2-specifieke risicoregels voor de prompt (leeg in v1-modus)."""
+    if params.get("exit_engine") != "ladder":
+        return ""
+    cfg = ladder_cfg_from_params(params)
+    lines = [
+        f"8. EXIT-ENGINE (live trailing-ladder): geef bij elke open ALTIJD een "
+        f"stop_loss. De engine zet op +{cfg['be_lock_r']:g}R de SL op breakeven en "
+        f"trailt vanaf +{cfg['trail_start_r']:g}R met {cfg['trail_dist_r']:g}R achter het "
+        f"gunstigste prijspunt; ladder-stops sluiten automatisch.",
+    ]
+    if cfg["tp_r"] > 0:
+        lines.append(
+            f"9. Take-profit ligt op +{cfg['tp_r']:g}R (door de engine geplaatst); "
+            "een eigen take_profit wordt genegeerd."
+        )
+    if params.get("hard_risk_rules"):
+        min_rr = max(0.0, float(params.get("min_rr", 1.2)))
+        gain_multiple = max(1.0, float(params.get("fee_gain_multiple", 3.0)))
+        lines.append(
+            f"10. Harde regels: SL én TP verplicht bij elke open; minimale R:R "
+            f"{min_rr:g}; verwachte TP-winst > {gain_multiple:g}x de round-trip fees "
+            "(0,09% van het notional); geen nieuwe entry in een cyclus direct na een "
+            "stop-type exit; bij een verliesreeks van 3+ halveert de engine de "
+            "marge-limiet. Voorstellen buiten deze regels worden geweigerd."
+        )
+    lines.append(
+        "- De ladder beschermt je posities: je hoeft winnende posities niet "
+        "handmatig te sluiten, maar slechte theses wel (model-close blijft mogelijk)."
+    )
+    return "\n".join(lines)
+
+
 def build_cycle_prompt(
     rows: list[dict[str, Any]],
     candles: dict[str, list[dict[str, Any]]],
@@ -1948,7 +2246,7 @@ RISICOREGELS (door de engine afgedwongen, voorstellen buiten deze regels worden 
 5. Taker fee 0,045% bij open en close; liquidatieprijs is een benadering op ~{int(LIQ_BUFFER * 100)}% van de 1/leverage-marge.
 6. Risicoprofiel: {params['risk_profile']}. Funding wordt in de simulatie niet meegenomen.
 7. Sentiment en nieuws zijn contextsignalen: speculeer niet buiten de gegeven data.
-
+{exit_rules_lines(params)}
 BESLISSCHEMA (antwoord uitsluitend als JSON conform het schema):
 - Beslis per coin in het universum: "open" (long of short), "close" (alleen als er een positie open staat), of "none".
 - Wees selectief: alleen een "open" als setup, trend en sentiment samenwijzen; een lege actielijst is een prima uitkomst.
@@ -2049,6 +2347,7 @@ def render_cycle_report(
             )
         lines.append("")
     lines.extend(shadow_b_report_lines(account, prices))
+    lines.extend(ladder_report_lines(account, prices))
     lines.append("## Beslissingen")
     lines.append("")
     lines.append(f"**Marktbeeld:** {decision.get('market_view', '-')}")

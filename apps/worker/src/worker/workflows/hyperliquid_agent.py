@@ -35,6 +35,7 @@ from worker.workflows import hl_analysis
 
 RISK_PROFILES = ("conservative", "balanced", "aggressive")
 TRADING_MODES = ("paper",)  # live is deliberately not supported (yet)
+EXIT_ENGINES = ("model", "ladder")  # v1: model-close | v2: live trailing-ladder
 
 _RETRYABLE_STATUS = {429, 500, 502, 503, 504}
 
@@ -74,6 +75,38 @@ class AgentInput(BaseModel):
     cycle_minute: int = Field(default=5, ge=0, le=59)
     guard_seconds: int = Field(default=900, ge=0, le=3600)  # 0 = guard uit
     trading_mode: str = "paper"
+    # --- v2-knoppen (defaults = exact v1-gedrag, zodat v1 niets verandert) ---
+    exit_engine: str = Field(
+        default="model",
+        description=(
+            "'model' (v1: model-close + SL/TP) of 'ladder' (v2: live "
+            "trailing-ladder beheert de exits: BE-lock op +be_lock_r, "
+            "trailing vanaf +trail_start_r met trail_dist_r achter de top)."
+        ),
+    )
+    be_lock_r: float = Field(default=1.0, ge=0.1, le=10.0)
+    trail_start_r: float = Field(default=2.0, ge=0.2, le=20.0)
+    trail_dist_r: float = Field(default=1.0, ge=0.1, le=10.0)
+    tp_r: float = Field(
+        default=0.0,
+        ge=0.0,
+        le=10.0,
+        description=(
+            "Take-profit op entry + tp_r x SL-afstand; 0 = uit (model-TP "
+            "of geen TP blijft staan)."
+        ),
+    )
+    hard_risk_rules: bool = Field(
+        default=False,
+        description=(
+            "v2-harde risicoregels: SL+TP verplicht, minimale R:R, "
+            "fee-throttle, cooldown na stop-type exit, marge-throttle bij "
+            "een verliesreeks van 3+."
+        ),
+    )
+    min_rr: float = Field(default=1.2, ge=0.0, le=10.0)
+    fee_gain_multiple: float = Field(default=3.0, ge=1.0, le=50.0)
+    margin_throttle_streak: int = Field(default=3, ge=1, le=20)
     seed: dict | None = Field(
         default=None,
         description=(
@@ -293,6 +326,17 @@ class HyperliquidTradingAgent:
             "max_open_positions": inp.max_open_positions,
             "daily_loss_limit_pct": inp.daily_loss_limit_pct,
             "risk_profile": inp.risk_profile,
+            "exit_engine": inp.exit_engine,
+            "ladder_cfg": {
+                "be_lock_r": inp.be_lock_r,
+                "trail_start_r": inp.trail_start_r,
+                "trail_dist_r": inp.trail_dist_r,
+                "tp_r": inp.tp_r,
+            },
+            "hard_risk_rules": inp.hard_risk_rules,
+            "min_rr": inp.min_rr,
+            "fee_gain_multiple": inp.fee_gain_multiple,
+            "margin_throttle_streak": inp.margin_throttle_streak,
         }
         account = self.account
         account["cycles"] += 1
@@ -314,6 +358,11 @@ class HyperliquidTradingAgent:
 
         # 2. Forced exits on open positions (liq, stop, target) at current prices.
         forced_events = hl_analysis.process_forced_exits(account, prices, now)
+
+        # 2b. v2: de live trailing-ladder beheert de stops zelf (fase-upgrades,
+        # trail-updates, ladder-stops) vóórdat het model iets voorstelt.
+        # In v1-modus (exit_engine="model") gebeurt hier niets.
+        forced_events += hl_analysis.ladder_manage_exits(account, prices, now, params)
 
         # 3. Market context: sentiment and news.
         fear_greed_raw = await fetch_fear_greed()
@@ -350,7 +399,9 @@ class HyperliquidTradingAgent:
 
         # Shadow exit-ladder (Upgrade B): meekijken met verse prijzen, nooit uitvoeren.
         # Bewust ná apply_actions: nieuwe posities krijgen dan direct een tracker.
-        hl_analysis.shadow_b_update(account, prices, now)
+        # In v2 (ladder-modus) is de ladder LIVE en is de shadow-versie uit.
+        if inp.exit_engine != "ladder":
+            hl_analysis.shadow_b_update(account, prices, now)
 
         report_markdown = hl_analysis.render_cycle_report(
             now_iso=now,
@@ -390,9 +441,24 @@ class HyperliquidTradingAgent:
         coins = [c.upper() for c in inp.universe]
         prices = await fetch_mid_prices(coins)
         events = hl_analysis.process_forced_exits(self.account, prices, now)
+        # v2: de ladder draait ook op guard-cadence mee (indien actief).
+        events += hl_analysis.ladder_manage_exits(
+            self.account, prices, now,
+            {
+                "exit_engine": inp.exit_engine,
+                "ladder_cfg": {
+                    "be_lock_r": inp.be_lock_r,
+                    "trail_start_r": inp.trail_start_r,
+                    "trail_dist_r": inp.trail_dist_r,
+                    "tp_r": inp.tp_r,
+                },
+            },
+        )
         # Shadow exit-ladder (Upgrade B) draait mee op guard-cadence (elke 15 min),
         # net als de echte ladder later zou doen; loggen, nooit uitvoeren.
-        hl_analysis.shadow_b_update(self.account, prices, now)
+        # In v2 (ladder-modus) is de ladder live en de shadow uit.
+        if inp.exit_engine != "ladder":
+            hl_analysis.shadow_b_update(self.account, prices, now)
         if events and self.last_cycle is not None:
             self.last_cycle["events"] = events
             self.last_cycle["guard_at"] = now
@@ -445,6 +511,10 @@ class HyperliquidTradingAgent:
         if input.interval not in hl_analysis.INTERVALS:
             raise ValueError(
                 f"interval moet een van {hl_analysis.INTERVALS} zijn, got: {input.interval}"
+            )
+        if input.exit_engine not in EXIT_ENGINES:
+            raise ValueError(
+                f"exit_engine moet een van {EXIT_ENGINES} zijn, got: {input.exit_engine}"
             )
 
         now = await now_utc()
