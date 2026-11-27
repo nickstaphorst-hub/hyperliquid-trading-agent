@@ -6,7 +6,9 @@ dependencies = [
     "utils",
     "env",
     "mistralai>=3.6.0",
-    "mistralai-workflows[mistralai]>=3.17.1",
+    # mistralai-workflows 4.0.0 (26-11-2026) heeft breaking changes; de agent
+    # draait op de 3.x-lijn. Pas na een expliciete migratie naar 4.x.
+    "mistralai-workflows[mistralai]>=3.17.1,<4.0.0",
     "pydantic>=2.14.1",
     "structlog>=25.5.0",
 ]
